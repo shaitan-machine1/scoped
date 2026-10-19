@@ -86,6 +86,13 @@ impl Manager {
 
     /// `List(prefix) -> ids`: every descendant scope under `prefix`, not
     /// including `prefix` itself.
+    ///
+    /// A `prefix` that doesn't exist yields an empty list rather than an
+    /// error, unlike the other methods. That's deliberate: intermediate
+    /// directories are cascaded away once their last descendant goes, so
+    /// e.g. `sessiond/user/1000/session` genuinely stops existing when the
+    /// user's last session ends, and "no sessions" is the right answer
+    /// there rather than a failure.
     async fn list(
         &self,
         prefix: String,
@@ -179,7 +186,7 @@ fn service_error(e: ServiceError) -> fdo::Error {
             fdo::Error::AccessDenied("caller does not own this process".into())
         }
         ServiceError::Policy(PolicyError::ProcessNotFound(pid)) => {
-            fdo::Error::UnixProcessIdUnknown(pid.to_string())
+            fdo::Error::UnixProcessIdUnknown(format!("process {pid} does not exist"))
         }
         ServiceError::Backend(BackendError::NotFound(id)) => {
             fdo::Error::FileNotFound(format!("scope {id} does not exist"))
@@ -191,7 +198,7 @@ fn service_error(e: ServiceError) -> fdo::Error {
             fdo::Error::AccessDenied(format!("permission denied operating on scope {id}"))
         }
         ServiceError::Backend(BackendError::ProcessNotFound(pid)) => {
-            fdo::Error::UnixProcessIdUnknown(pid.to_string())
+            fdo::Error::UnixProcessIdUnknown(format!("process {pid} does not exist"))
         }
         ServiceError::Backend(e @ BackendError::Io { .. }) => fdo::Error::Failed(e.to_string()),
     }

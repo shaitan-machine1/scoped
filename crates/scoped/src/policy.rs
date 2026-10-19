@@ -39,6 +39,22 @@ pub fn check_address(caller_uid: u32, id: &ScopeId) -> Result<(), PolicyError> {
 
 /// Whether `caller_uid` may act on `pid` directly (root: anything; uid N:
 /// only processes it owns).
+///
+/// # Known weakness: pid reuse (TOCTOU)
+///
+/// This resolves a *number* to an owner, and the caller then acts on that
+/// same number. If the process exits in between and the kernel recycles
+/// its pid for an unrelated (possibly root-owned) process, the action
+/// lands on the wrong process: an unprivileged caller could get a
+/// root-owned process moved into a scope it controls, and then kill it.
+/// The window is tiny and winning it requires driving pid wraparound, but
+/// it is a real hole, not a theoretical one.
+///
+/// Closing it properly means pinning the process identity for the whole
+/// operation -- hold an `O_PATH` fd on `/proc/<pid>` (or a pidfd), read
+/// the uid and the current cgroup through *that*, act, then re-validate
+/// through the same fd and undo if the identity changed. That is deferred:
+/// see the README's "Known limitations".
 pub fn check_owns_process(caller_uid: u32, pid: u32) -> Result<(), PolicyError> {
     if caller_uid == 0 {
         return Ok(());

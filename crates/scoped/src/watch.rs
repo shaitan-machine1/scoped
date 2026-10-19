@@ -142,7 +142,7 @@ impl Watchers {
     }
 
     fn handle_empty(&self, id: &ScopeId, path: &Path) {
-        self.emit_empty(id);
+        self.emit_empty_blocking(id);
         if std::fs::remove_dir(path).is_err() {
             // Raced with a fresh Move() landing just as we observed
             // "populated 0" (or someone else removed it already). Either
@@ -151,7 +151,7 @@ impl Watchers {
             // Create(), or this is simply gone.
             return;
         }
-        self.emit_removed(id);
+        self.emit_removed_blocking(id);
         self.cascade(id);
     }
 
@@ -162,7 +162,7 @@ impl Watchers {
         for ancestor in id.ancestors() {
             let path = self.0.backend.fs_path(&ancestor);
             match std::fs::remove_dir(&path) {
-                Ok(()) => self.emit_removed(&ancestor),
+                Ok(()) => self.emit_removed_blocking(&ancestor),
                 Err(_) => break,
             }
         }
@@ -178,24 +178,39 @@ impl Watchers {
         }
     }
 
-    fn emit_empty(&self, id: &ScopeId) {
+    async fn emit_empty(&self, id: &ScopeId) {
         let Some(emitter) = self.emitter(id) else {
             return;
         };
         let id_str = id.to_string();
-        if let Err(e) = zbus::block_on(Manager::scope_empty(&emitter, &id_str)) {
+        if let Err(e) = Manager::scope_empty(&emitter, &id_str).await {
             tracing::warn!(%id, error = %e, "failed to emit ScopeEmpty");
         }
     }
 
-    fn emit_removed(&self, id: &ScopeId) {
+    async fn emit_removed(&self, id: &ScopeId) {
         let Some(emitter) = self.emitter(id) else {
             return;
         };
         let id_str = id.to_string();
-        if let Err(e) = zbus::block_on(Manager::scope_removed(&emitter, &id_str)) {
+        if let Err(e) = Manager::scope_removed(&emitter, &id_str).await {
             tracing::warn!(%id, error = %e, "failed to emit ScopeRemoved");
         }
+    }
+
+    // The `_blocking` wrappers below are for the watcher threads, which are
+    // plain OS threads of our own and so may block on the bus runtime.
+    // Anything already running *inside* that runtime (notably
+    // `startup_scan`, which runs as part of `main`'s top-level future) must
+    // use the `async` forms instead: `zbus::block_on` panics outright when
+    // called from a task the runtime is driving.
+
+    fn emit_empty_blocking(&self, id: &ScopeId) {
+        zbus::block_on(self.emit_empty(id));
+    }
+
+    fn emit_removed_blocking(&self, id: &ScopeId) {
+        zbus::block_on(self.emit_removed(id));
     }
 
     /// Walks the whole managed tree once, bottom-up: removes any leaf
@@ -210,24 +225,33 @@ impl Watchers {
     /// are an empty leaf directory. This sweep removes both; the caller
     /// that was about to `Move()` into it gets a `NotFound` error instead
     /// of succeeding. See the plan's "Accepted limitations".
-    pub fn startup_scan(&self) {
+    pub async fn startup_scan(&self) {
         let base = self.0.backend.base();
-        self.scan_dir(&base);
+        // The sweep itself is synchronous and must not touch the bus: it
+        // runs as part of the daemon's top-level future, where
+        // `zbus::block_on` would panic. So it just records what it removed
+        // and the signals go out here, afterwards.
+        let mut removed = Vec::new();
+        self.scan_dir(&base, &mut removed);
+        for id in &removed {
+            self.emit_removed(id).await;
+        }
     }
 
     /// Returns `true` if `dir` ends up with no children and no members
     /// after this call (i.e. the caller should remove it itself).
-    fn scan_dir(&self, dir: &Path) -> bool {
+    /// Appends every scope it removes to `removed`.
+    fn scan_dir(&self, dir: &Path, removed: &mut Vec<ScopeId>) -> bool {
         let base = self.0.backend.base();
         let is_root = dir == base.as_path();
         let children = RealBackend::subdirs(dir).unwrap_or_default();
         let mut all_children_gone = true;
         for name in &children {
             let child = dir.join(name);
-            if self.scan_dir(&child) {
+            if self.scan_dir(&child, removed) {
                 if std::fs::remove_dir(&child).is_ok() {
                     if let Some(id) = self.0.backend.id_for_path(&child) {
-                        self.emit_removed(&id);
+                        removed.push(id);
                     }
                 } else {
                     all_children_gone = false;

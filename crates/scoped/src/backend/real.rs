@@ -202,6 +202,21 @@ impl CgroupBackend for RealBackend {
         Self::read_procs(&self.fs_path(id)).map_err(|e| BackendError::from_io(id, "members", e))
     }
 
+    /// Signals every member of `id` and its descendants, one pid at a
+    /// time.
+    ///
+    /// Inherently racy, in two ways the kernel gives us no way to avoid
+    /// for an arbitrary signal (`cgroup.kill`, used by
+    /// [`CgroupBackend::kill`], is atomic but SIGKILL-only):
+    ///
+    /// - a process that forks while we're walking the list may not be
+    ///   signalled at all;
+    /// - a pid that exits between being read out of `cgroup.procs` and
+    ///   being signalled may have been recycled, so the signal lands on an
+    ///   unrelated process.
+    ///
+    /// Freezing the cgroup (`cgroup.freeze`) around the walk would close
+    /// both; see the README's "Known limitations".
     fn terminate(&self, id: &ScopeId, signal: Signal) -> Result<(), BackendError> {
         let mut pids = self.members(id)?;
         for descendant in self.list(id)? {

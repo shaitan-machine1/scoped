@@ -25,14 +25,10 @@ pub struct Config {
     #[arg(long, default_value = "scoped")]
     pub scope_root: String,
 
-    /// Which bus to serve the manager object on.
+    /// Which bus to serve the manager object on. Both honor the usual
+    /// `DBUS_SYSTEM_BUS_ADDRESS` / `DBUS_SESSION_BUS_ADDRESS` environment
+    /// variables, which is how `tests/e2e.rs` points `scoped` at the
+    /// private bus it runs each case against.
     #[arg(long, value_enum, default_value_t = Bus::System)]
     pub bus: Bus,
-
-    /// Well-known bus name to request. Defaults to
-    /// `org.decoupling.scoped1`; overridable so more than one instance
-    /// (e.g. several `tests/e2e.rs` cases) can run against the same bus at
-    /// once without colliding.
-    #[arg(long)]
-    pub bus_name: Option<String>,
 }

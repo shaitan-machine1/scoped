@@ -56,16 +56,15 @@ async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     );
 
     tracing::info!("scanning for leftover scopes from a previous run");
-    watchers.startup_scan();
+    watchers.startup_scan().await;
 
     let manager = Manager::new(service, watchers);
     connection
         .object_server()
         .at(dbus::OBJECT_PATH, manager)
         .await?;
-    let bus_name = config.bus_name.as_deref().unwrap_or(dbus::BUS_NAME);
-    connection.request_name(bus_name).await?;
-    tracing::info!(name = bus_name, path = dbus::OBJECT_PATH, "serving");
+    connection.request_name(dbus::BUS_NAME).await?;
+    tracing::info!(name = dbus::BUS_NAME, path = dbus::OBJECT_PATH, "serving");
 
     // The connection runs on its own helper thread/task from here on (see
     // the zbus README's "Compatibility with async runtimes" section); we

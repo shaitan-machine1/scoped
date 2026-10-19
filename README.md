@@ -16,6 +16,9 @@ This repo is a two-crate Cargo workspace:
 | [`crates/scope-id`](crates/scope-id) | Dependency-free library: scope ID parsing/validation, the `sessiond/...`/`user/...` naming conventions, and the "which caller may address which ID" policy rule. Pinned by git tag from other repos (e.g. `sessiond`). |
 | [`crates/scoped`](crates/scoped) | The `scoped` binary: D-Bus service, cgroup v2 backend, empty-scope watcher/GC. |
 
+Plus [`dist/dbus/org.decoupling.scoped1.conf`](dist/dbus/org.decoupling.scoped1.conf),
+the bus policy -- see [Installing](#installing).
+
 Inside `crates/scoped/src`:
 
 - `backend/` -- `CgroupBackend` trait and `RealBackend`, the only code that
@@ -47,28 +50,59 @@ cargo fmt --check
 ### End-to-end tests (need root)
 
 `crates/scoped/tests/e2e.rs` drives the actual compiled binary against a
-real cgroup v2 filesystem and a real D-Bus system bus: `Create`/`Move`/
-`ScopeOf`/`List`, graceful `Terminate` vs. forceful `Kill`, policy
-(non-root denial), and restart survival (a hard-killed `scoped`, restarted
-against the same cgroup subtree, sweeps never-populated scopes and resumes
-watching populated ones). These are `#[ignore]`d by default, so a plain
-`cargo test` never touches real cgroups:
+real cgroup v2 filesystem and a real D-Bus daemon: `Create`/`Move`/
+`ScopeOf`/`List`, graceful `Terminate` vs. forceful `Kill`, an
+unprivileged caller being confined to its own namespace, and restart
+survival (a hard-killed `scoped`, restarted against the same cgroup
+subtree, sweeps never-populated scopes and resumes watching populated
+ones).
+
+Each case is hermetic: it starts its own `dbus-daemon` on a private socket
+and gets its own `--scope-root`, so the tests need no installed bus policy
+and don't disturb a `scoped` already running on the machine. They need
+root, a cgroup2 mount (`SCOPED_E2E_CGROUP_MOUNT` to override
+`/sys/fs/cgroup`), and `dbus-daemon`/`busctl` on `PATH`.
+
+They're `#[ignore]`d, so a plain `cargo test` never touches real cgroups:
 
 ```sh
 sudo -E cargo test -p scoped --test e2e -- --ignored --test-threads=4
+
+# If cargo isn't on root's PATH, build as yourself and run the test binary:
+cargo test -p scoped --test e2e --no-run
+sudo ./target/debug/deps/e2e-* --ignored --test-threads=4
 ```
+
+## Installing
+
+The system bus denies owning any name by default (`<deny own="*"/>` in
+`system.conf`), so the bus policy has to be installed or `scoped` will
+fail at startup with `org.freedesktop.DBus.Error.AccessDenied: Request to
+own name refused by policy`:
+
+```sh
+install -Dm644 dist/dbus/org.decoupling.scoped1.conf \
+    /usr/share/dbus-1/system.d/org.decoupling.scoped1.conf
+```
+
+That policy lets method calls through from any uid on purpose: `scoped`
+does its own authorization from the caller's uid, which is what lets an
+unprivileged caller manage its own `user/<uid>/...` scopes without a
+bus-policy change per user.
 
 ## Running it by hand
 
 ```sh
-# Against the session bus, for poking at it without root or a system-bus
-# policy file:
-cargo run -p scoped -- --bus session --cgroup-mount /tmp/cgroup-test --scope-root scoped
-
 # Production: system bus, real cgroup2 mount, default scope root
 # (/sys/fs/cgroup/scoped). Needs root (or a delegated, writable subtree).
-sudo cargo run -p scoped -- --bus system
+sudo scoped --bus system
+
+# Against the session bus, for poking at it without a system-bus policy
+# file. Still needs write access to whatever --cgroup-mount points at.
+cargo run -p scoped -- --bus session --cgroup-mount /tmp/cgroup-test
 ```
+
+Both honor `DBUS_SYSTEM_BUS_ADDRESS` / `DBUS_SESSION_BUS_ADDRESS`.
 
 ```sh
 busctl --system call org.decoupling.scoped1 /org/decoupling/scoped1 \
@@ -90,7 +124,7 @@ tests):
 | `Create(id)` | `s` -> `()` | Atomic; `FileExists` if `id` already exists. |
 | `Move(pid, id)` | `us` -> `()` | Non-root callers may only move processes they own. |
 | `ScopeOf(pid)` | `u` -> `s` | Empty string if `pid` isn't in any managed scope. |
-| `List(prefix)` | `s` -> `as` | Every descendant under `prefix`, not including `prefix` itself. |
+| `List(prefix)` | `s` -> `as` | Every descendant under `prefix`, not including `prefix` itself. A missing `prefix` gives an empty list, not an error. |
 | `Terminate(id, signal)` | `si` -> `()` | Signals every process in `id` and its descendants; does not wait. |
 | `Kill(id)` | `s` -> `()` | SIGKILLs the whole subtree via `cgroup.kill`. |
 | `ScopeEmpty(id)` | signal, `s` | A scope's population (itself or any descendant) dropped to zero. |
@@ -123,14 +157,40 @@ owns. The `sessiond/...` namespace is root-only.
   the plan's "doesn't wait" semantics. `Kill` writes to `cgroup.kill`,
   which the kernel guarantees is atomic and recursive.
 
-### Accepted limitations (carried over from the plan)
+### Known limitations
 
-- A scope `Create()`-d right before a crash, with its `Move()` not yet
-  landed, is indistinguishable on disk from stale leftover garbage: both
-  are an empty leaf directory. The restart sweep removes both; the caller
-  that was about to `Move()` into it gets `FileNotFound` instead of
-  succeeding.
-- `ScopeOf`/ownership checks assume `scoped` and the processes it manages
-  share the host's cgroup namespace (true for a normal, non-containerized
-  deployment; `/proc/<pid>/cgroup` paths are otherwise relative to the
-  *reader's* cgroup namespace, not the target's).
+- **Pid reuse (TOCTOU).** `Move` resolves a pid to an owner and then acts
+  on that same number. If the process exits in between and the pid is
+  recycled for a root-owned one, an unprivileged caller can get a process
+  it doesn't own moved into a scope it controls -- and then kill it. The
+  window is tiny and exploiting it means driving pid wraparound, but it's
+  real. The fix is to pin the process identity across the whole operation
+  with an `O_PATH` fd on `/proc/<pid>` (or a pidfd): read uid and current
+  cgroup through it, act, re-validate, undo on mismatch.
+- **`Terminate` is racy by construction.** It walks `cgroup.procs` and
+  signals pids one at a time, so a process that forks mid-walk can be
+  missed, and a pid that exits mid-walk can be recycled and signalled by
+  mistake. `Kill` has neither problem (`cgroup.kill` is atomic and
+  recursive) but is SIGKILL-only. Freezing the cgroup around the walk
+  would close both.
+- **A `Create()`-d scope that never gets a member is never collected**
+  until the next restart, since the GC only fires on a real 1 -> 0
+  transition. A client that calls `Create` and then dies leaks an empty
+  directory.
+- **The restart sweep can't tell a pending scope from garbage.** A scope
+  `Create()`-d right before a crash, with its `Move()` not yet landed,
+  looks exactly like stale leftovers on disk: an empty leaf directory. The
+  sweep removes both, so the caller that was about to `Move()` into it
+  gets `FileNotFound` instead of succeeding.
+- **No resource control.** `scoped` never writes `cgroup.subtree_control`,
+  so no controllers are enabled on the scopes it makes. That's what keeps
+  the "no internal processes" rule from biting (a scope may hold both
+  processes and child scopes), but it also means scopes can't carry limits
+  yet.
+- **Host cgroup namespace assumed.** `ScopeOf` maps `/proc/<pid>/cgroup`
+  back to a scope id by prefix. Those paths are relative to the *reader's*
+  cgroup namespace, so `scoped` and the processes it manages have to share
+  one -- true for a normal, non-containerized deployment.
+- **No graceful shutdown yet.** SIGTERM/SIGINT aren't handled; `scoped`
+  keeps no state outside the cgroup tree, so it's restart-safe regardless,
+  but the watcher threads are simply torn down with the process.
