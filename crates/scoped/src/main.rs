@@ -2,7 +2,6 @@ mod backend;
 mod config;
 mod dbus;
 mod policy;
-mod procfs;
 mod service;
 mod watch;
 

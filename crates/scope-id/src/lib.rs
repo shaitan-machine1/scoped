@@ -6,17 +6,18 @@
 //! never a path relative to the real cgroup2 mount point directly -- that
 //! mapping is `scoped`'s own concern, not this crate's).
 //!
-//! This crate only knows about the *shape* of scope IDs: which strings are
-//! valid, how to build the well-known ones used by sessiond's own scopes,
-//! and the "which caller may address which ID" naming rule from the plan.
-//! It does not know about cgroups, D-Bus, or processes, and deliberately
-//! has no dependencies, since other repos (sessiond, and anything else that
+//! This crate only knows about portable identifier syntax and how to build
+//! the well-known scope IDs used by sessiond. It does not know about cgroups,
+//! D-Bus, authorization, or processes, and deliberately has no dependencies,
+//! since other repos (sessiond, and anything else that
 //! needs to agree on these conventions) pin it by git tag.
 #![forbid(unsafe_code)]
 
 mod error;
+mod target;
 
 pub use error::ParseError;
+pub use target::{TargetId, TargetIdError, MAX_TARGET_ID_LEN};
 
 /// Maximum length, in bytes, of an encoded scope id (including `/` separators).
 pub const MAX_LEN: usize = 4096;
@@ -197,8 +198,7 @@ pub fn validate_segment(s: &str) -> Result<(), ParseError> {
 }
 
 /// Builders for the scope IDs the plan reserves under `sessiond/...` and
-/// `user/...`. These namespaces, and only these, have policy meaning (see
-/// [`policy::caller_may_address`]).
+/// `user/...`.
 pub mod well_known {
     use super::*;
 
@@ -228,19 +228,6 @@ pub mod well_known {
     /// validated as a single segment.
     pub fn sessiond_user_session(uid: u32, sid: &str) -> Result<ScopeId, ParseError> {
         sessiond_user_session_root(uid).join(sid)
-    }
-}
-
-/// The scope-addressing policy from the plan: "root: anything. UID N: only
-/// `user/<N>/...`". This only covers the *namespace* rule; per-operation
-/// extras (e.g. "Move only processes it owns") are `scoped`'s own concern,
-/// since they need process information this crate has no access to.
-pub mod policy {
-    use super::*;
-
-    /// Whether a caller with the given uid may address `id` at all.
-    pub fn caller_may_address(caller_uid: u32, id: &ScopeId) -> bool {
-        caller_uid == 0 || id.is_or_is_under(&well_known::user_root(caller_uid))
     }
 }
 
@@ -365,25 +352,6 @@ mod tests {
             "sessiond/user/1000/session/abc"
         );
         assert!(well_known::sessiond_user_session(1000, "a/b").is_err());
-    }
-
-    #[test]
-    fn policy_caller_may_address() {
-        use policy::caller_may_address;
-
-        let user_scope = ScopeId::parse("user/1000/sandbox").unwrap();
-        let other_user_scope = ScopeId::parse("user/2000/sandbox").unwrap();
-        let sessiond_scope = ScopeId::parse("sessiond/user/1000/service").unwrap();
-
-        // root may address anything.
-        assert!(caller_may_address(0, &user_scope));
-        assert!(caller_may_address(0, &sessiond_scope));
-
-        // uid 1000 may only address its own user/1000/... subtree.
-        assert!(caller_may_address(1000, &user_scope));
-        assert!(caller_may_address(1000, &well_known::user_root(1000)));
-        assert!(!caller_may_address(1000, &other_user_scope));
-        assert!(!caller_may_address(1000, &sessiond_scope));
     }
 
     #[test]

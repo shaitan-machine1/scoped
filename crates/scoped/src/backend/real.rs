@@ -1,8 +1,9 @@
-use super::{BackendError, CgroupBackend, Pid, Signal};
-use scope_id::ScopeId;
+use super::{BackendError, CgroupBackend, Pid, ProcessHandle, TargetStatus};
+use scope_id::{ScopeId, TargetId};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 /// A [`CgroupBackend`] backed by a real cgroup v2 filesystem.
 ///
@@ -13,6 +14,7 @@ use std::path::{Path, PathBuf};
 pub struct RealBackend {
     mount: PathBuf,
     scope_root: String,
+    pub(super) target_lock: Mutex<()>,
 }
 
 /// How many times [`RealBackend::create`] retries after losing a benign
@@ -24,7 +26,11 @@ impl RealBackend {
     pub fn new(mount: PathBuf, scope_root: String) -> io::Result<Self> {
         scope_id::validate_segment(&scope_root)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
-        let backend = RealBackend { mount, scope_root };
+        let backend = RealBackend {
+            mount,
+            scope_root,
+            target_lock: Mutex::new(()),
+        };
         fs::create_dir_all(backend.base())?;
         Ok(backend)
     }
@@ -111,6 +117,7 @@ impl RealBackend {
         Ok(false)
     }
 
+    #[cfg(test)]
     fn read_procs(path: &Path) -> io::Result<Vec<Pid>> {
         let content = fs::read_to_string(path.join("cgroup.procs"))?;
         Ok(content
@@ -152,13 +159,58 @@ impl CgroupBackend for RealBackend {
         ))
     }
 
-    fn exists(&self, id: &ScopeId) -> Result<bool, BackendError> {
-        Ok(self.fs_path(id).is_dir())
-    }
+    fn move_pid(
+        &self,
+        pid: Pid,
+        id: &ScopeId,
+        target: Option<&TargetId>,
+    ) -> Result<(), BackendError> {
+        // The cgroup API still consumes a numeric PID, so this cannot make
+        // migration itself pidfd-atomic. Pinning before the write and
+        // checking identity + membership afterwards does, however, detect a
+        // target that exited during the operation and ensures a durable
+        // target binding never points at a recycled PID.
+        let handle = ProcessHandle::open(pid).map_err(|e| {
+            if e.kind() == io::ErrorKind::NotFound {
+                BackendError::ProcessNotFound(pid)
+            } else {
+                BackendError::io(format!("pinning process {pid} for move"), e)
+            }
+        })?;
+        let identity = handle.identity();
+        let _guard = self.target_lock.lock().unwrap();
+        if let Some(target) = target {
+            self.prepare_target_move(id, target, &handle)?;
+        }
 
-    fn move_pid(&self, pid: Pid, id: &ScopeId) -> Result<(), BackendError> {
         let path = self.fs_path(id).join("cgroup.procs");
-        fs::write(&path, pid.to_string()).map_err(|e| BackendError::from_io(id, "move pid", e))
+        if let Err(e) = fs::write(&path, pid.to_string()) {
+            if let Some(target) = target {
+                self.abort_target_move(id, target, identity);
+            }
+            return Err(BackendError::from_io(id, "move pid", e));
+        }
+
+        let valid = handle
+            .identity_still_matches()
+            .map_err(|e| BackendError::io(format!("revalidating process {pid} after move"), e))?
+            && matches!(self.scope_of(pid), Ok(Some(actual)) if actual == *id);
+        if !valid {
+            if let Some(target) = target {
+                self.abort_target_move(id, target, identity);
+            }
+            return Err(BackendError::ProcessNotFound(pid));
+        }
+        if let Some(target) = target {
+            if let Err(e) = self.activate_target_move(id, target, identity) {
+                // The process is already in the destination, but exposing a
+                // half-registered target would be worse than returning an
+                // untracked move that the root caller can safely retry.
+                self.abort_target_move(id, target, identity);
+                return Err(e);
+            }
+        }
+        Ok(())
     }
 
     fn scope_of(&self, pid: Pid) -> Result<Option<ScopeId>, BackendError> {
@@ -180,13 +232,15 @@ impl CgroupBackend for RealBackend {
         };
         let cg_path = &line[3..];
         let prefix = self.cgroup_rel_prefix();
-        let Some(rest) = cg_path.strip_prefix(&prefix) else {
+        if cg_path == prefix {
+            return Ok(None); // managed root itself is not a ScopeId
+        }
+        // Require a component boundary: `/scoped-other/...` is not under a
+        // managed root named `/scoped`.
+        let child_prefix = format!("{prefix}/");
+        let Some(rest) = cg_path.strip_prefix(&child_prefix) else {
             return Ok(None);
         };
-        let rest = rest.strip_prefix('/').unwrap_or(rest);
-        if rest.is_empty() {
-            return Ok(None);
-        }
         Ok(ScopeId::parse(rest).ok())
     }
 
@@ -198,45 +252,79 @@ impl CgroupBackend for RealBackend {
         Ok(out)
     }
 
-    fn members(&self, id: &ScopeId) -> Result<Vec<Pid>, BackendError> {
-        Self::read_procs(&self.fs_path(id)).map_err(|e| BackendError::from_io(id, "members", e))
+    fn target_exists(&self, id: &ScopeId, target: &TargetId) -> Result<bool, BackendError> {
+        match self.target_status(id, target) {
+            Ok(TargetStatus::Live(_)) => Ok(true),
+            Ok(TargetStatus::Missing | TargetStatus::Gone) | Err(BackendError::NotFound(_)) => {
+                Ok(false)
+            }
+            Err(e) => Err(e),
+        }
     }
 
-    /// Signals every member of `id` and its descendants, one pid at a
-    /// time.
-    ///
-    /// Inherently racy, in two ways the kernel gives us no way to avoid
-    /// for an arbitrary signal (`cgroup.kill`, used by
-    /// [`CgroupBackend::kill`], is atomic but SIGKILL-only):
-    ///
-    /// - a process that forks while we're walking the list may not be
-    ///   signalled at all;
-    /// - a pid that exits between being read out of `cgroup.procs` and
-    ///   being signalled may have been recycled, so the signal lands on an
-    ///   unrelated process.
-    ///
-    /// Freezing the cgroup (`cgroup.freeze`) around the walk would close
-    /// both; see the README's "Known limitations".
-    fn terminate(&self, id: &ScopeId, signal: Signal) -> Result<(), BackendError> {
-        let mut pids = self.members(id)?;
-        for descendant in self.list(id)? {
-            pids.extend(self.members(&descendant)?);
+    fn terminate_target(&self, id: &ScopeId, target: &TargetId) -> Result<(), BackendError> {
+        match self.target_status(id, target)? {
+            TargetStatus::Missing => Err(BackendError::TargetNotFound {
+                scope: id.clone(),
+                target: target.clone(),
+            }),
+            TargetStatus::Gone => Err(BackendError::TargetGone {
+                scope: id.clone(),
+                target: target.clone(),
+            }),
+            TargetStatus::Live(handle) => handle.send_terminate().map_err(|e| {
+                if e.raw_os_error() == Some(rustix::io::Errno::SRCH.raw_os_error()) {
+                    BackendError::TargetGone {
+                        scope: id.clone(),
+                        target: target.clone(),
+                    }
+                } else {
+                    BackendError::io(format!("terminate target {target} in scope {id}"), e)
+                }
+            }),
         }
-        for pid in pids {
-            // Best-effort: a process that already exited is not an error.
-            let _ = nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid as i32), signal);
-        }
-        Ok(())
     }
 
-    fn kill(&self, id: &ScopeId) -> Result<(), BackendError> {
+    fn kill_target(&self, id: &ScopeId, target: &TargetId) -> Result<(), BackendError> {
+        match self.target_status(id, target)? {
+            TargetStatus::Missing => Err(BackendError::TargetNotFound {
+                scope: id.clone(),
+                target: target.clone(),
+            }),
+            TargetStatus::Gone => Err(BackendError::TargetGone {
+                scope: id.clone(),
+                target: target.clone(),
+            }),
+            TargetStatus::Live(handle) => handle.send_kill().map_err(|e| {
+                if e.raw_os_error() == Some(rustix::io::Errno::SRCH.raw_os_error()) {
+                    BackendError::TargetGone {
+                        scope: id.clone(),
+                        target: target.clone(),
+                    }
+                } else {
+                    BackendError::io(format!("kill target {target} in scope {id}"), e)
+                }
+            }),
+        }
+    }
+
+    fn kill_scope(&self, id: &ScopeId) -> Result<(), BackendError> {
         let path = self.fs_path(id).join("cgroup.kill");
-        fs::write(&path, "1").map_err(|e| BackendError::from_io(id, "kill", e))
+        match fs::write(&path, "1") {
+            Ok(()) => Ok(()),
+            // Teardown is idempotent: an already-empty scope may be removed
+            // between ScopePopulated and KillScope.
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(BackendError::from_io(id, "kill scope", e)),
+        }
     }
 
     fn is_populated(&self, id: &ScopeId) -> Result<bool, BackendError> {
-        Self::read_populated(&self.fs_path(id))
-            .map_err(|e| BackendError::from_io(id, "is_populated", e))
+        match Self::read_populated(&self.fs_path(id)) {
+            Ok(populated) => Ok(populated),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(BackendError::from_io(id, "is_populated", e)),
+        }
     }
 }
 
@@ -270,7 +358,6 @@ mod tests {
         let id = ScopeId::parse("sessiond/user/1000/session/abc").unwrap();
         b.create(&id).unwrap();
         assert!(b.fs_path(&id).is_dir());
-        assert!(b.exists(&id).unwrap());
         // Intermediate directories exist too.
         assert!(b.base().join("sessiond/user/1000/session").is_dir());
 
@@ -313,7 +400,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let b = backend(&tmp);
         let id = ScopeId::parse("user/1000/sandbox").unwrap();
-        assert!(!b.exists(&id).unwrap());
+        assert!(!b.fs_path(&id).is_dir());
     }
 
     #[test]
@@ -336,22 +423,9 @@ mod tests {
         let id = ScopeId::parse("user/1000/sandbox").unwrap();
         b.create(&id).unwrap();
         fs::write(b.fs_path(&id).join("cgroup.procs"), "123\n456\n").unwrap();
-        let mut members = b.members(&id).unwrap();
+        let mut members = RealBackend::read_procs(&b.fs_path(&id)).unwrap();
         members.sort();
         assert_eq!(members, vec![123, 456]);
-    }
-
-    #[test]
-    fn move_pid_writes_to_cgroup_procs() {
-        let tmp = tempfile::tempdir().unwrap();
-        let b = backend(&tmp);
-        let id = ScopeId::parse("user/1000/sandbox").unwrap();
-        b.create(&id).unwrap();
-        // Not a real cgroup.procs, so this is a plain file write -- but it
-        // does exercise the same path and error-mapping move_pid uses.
-        fs::write(b.fs_path(&id).join("cgroup.procs"), "").unwrap();
-        b.move_pid(999, &id).unwrap();
-        assert_eq!(b.members(&id).unwrap(), vec![999]);
     }
 
     #[test]
@@ -359,7 +433,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let b = backend(&tmp);
         let id = ScopeId::parse("user/1000/sandbox").unwrap();
-        match b.move_pid(1, &id) {
+        match b.move_pid(1, &id, None) {
             Err(BackendError::NotFound(got)) => assert_eq!(got, id),
             other => panic!("expected NotFound, got {other:?}"),
         }

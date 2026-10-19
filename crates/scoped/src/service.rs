@@ -1,13 +1,10 @@
-//! The core "Create/Move/ScopeOf/List/Terminate/Kill" logic, independent of
-//! D-Bus: a thin, policy-enforcing wrapper around a [`CgroupBackend`].
-//! Kept separate from `crate::dbus` so it can be unit tested without a bus.
+//! Root-only, platform-independent scoped service logic.
 
-use crate::backend::{BackendError, CgroupBackend, Pid, Signal};
+use crate::backend::{BackendError, CgroupBackend, Pid};
 use crate::policy::{self, PolicyError};
-use scope_id::ScopeId;
+use scope_id::{ScopeId, TargetId};
 use std::fmt;
 
-/// Errors `Service` methods can return.
 #[derive(Debug)]
 pub enum ServiceError {
     Policy(PolicyError),
@@ -44,8 +41,6 @@ impl From<BackendError> for ServiceError {
     }
 }
 
-/// The scope manager's core logic, generic over the backend so tests can
-/// swap in a fake for the parts that don't need real cgroup semantics.
 pub struct Service<B: CgroupBackend> {
     backend: B,
 }
@@ -55,57 +50,79 @@ impl<B: CgroupBackend> Service<B> {
         Service { backend }
     }
 
-    /// Direct backend access, for diagnostics and tests.
     #[allow(dead_code)]
     pub fn backend(&self) -> &B {
         &self.backend
     }
 
-    /// `Create(id)`: atomic, fails if `id` already exists.
     pub fn create(&self, caller_uid: u32, id: &ScopeId) -> Result<(), ServiceError> {
-        policy::check_address(caller_uid, id)?;
+        policy::check_root(caller_uid)?;
         self.backend.create(id)?;
         Ok(())
     }
 
-    /// `Move(pid, id)`: moves a process into a scope. A non-root caller may
-    /// only move processes it owns.
-    pub fn move_pid(&self, caller_uid: u32, pid: Pid, id: &ScopeId) -> Result<(), ServiceError> {
-        policy::check_address(caller_uid, id)?;
-        policy::check_owns_process(caller_uid, pid)?;
-        self.backend.move_pid(pid, id)?;
+    pub fn move_pid(
+        &self,
+        caller_uid: u32,
+        pid: Pid,
+        id: &ScopeId,
+        target: Option<&TargetId>,
+    ) -> Result<(), ServiceError> {
+        policy::check_root(caller_uid)?;
+        self.backend.move_pid(pid, id, target)?;
         Ok(())
     }
 
-    /// `ScopeOf(pid) -> id`. A non-root caller may only query processes it
-    /// owns.
     pub fn scope_of(&self, caller_uid: u32, pid: Pid) -> Result<Option<ScopeId>, ServiceError> {
-        policy::check_owns_process(caller_uid, pid)?;
+        policy::check_root(caller_uid)?;
         Ok(self.backend.scope_of(pid)?)
     }
 
-    /// `List(prefix) -> ids`.
     pub fn list(&self, caller_uid: u32, prefix: &ScopeId) -> Result<Vec<ScopeId>, ServiceError> {
-        policy::check_address(caller_uid, prefix)?;
+        policy::check_root(caller_uid)?;
         Ok(self.backend.list(prefix)?)
     }
 
-    /// `Terminate(id, signal)`: signals all members; does not wait.
-    pub fn terminate(
+    pub fn target_exists(
         &self,
         caller_uid: u32,
         id: &ScopeId,
-        signal: Signal,
+        target: &TargetId,
+    ) -> Result<bool, ServiceError> {
+        policy::check_root(caller_uid)?;
+        Ok(self.backend.target_exists(id, target)?)
+    }
+
+    pub fn scope_populated(&self, caller_uid: u32, id: &ScopeId) -> Result<bool, ServiceError> {
+        policy::check_root(caller_uid)?;
+        Ok(self.backend.is_populated(id)?)
+    }
+
+    pub fn terminate_target(
+        &self,
+        caller_uid: u32,
+        id: &ScopeId,
+        target: &TargetId,
     ) -> Result<(), ServiceError> {
-        policy::check_address(caller_uid, id)?;
-        self.backend.terminate(id, signal)?;
+        policy::check_root(caller_uid)?;
+        self.backend.terminate_target(id, target)?;
         Ok(())
     }
 
-    /// `Kill(id)`: SIGKILLs all members via `cgroup.kill`.
-    pub fn kill(&self, caller_uid: u32, id: &ScopeId) -> Result<(), ServiceError> {
-        policy::check_address(caller_uid, id)?;
-        self.backend.kill(id)?;
+    pub fn kill_target(
+        &self,
+        caller_uid: u32,
+        id: &ScopeId,
+        target: &TargetId,
+    ) -> Result<(), ServiceError> {
+        policy::check_root(caller_uid)?;
+        self.backend.kill_target(id, target)?;
+        Ok(())
+    }
+
+    pub fn kill_scope(&self, caller_uid: u32, id: &ScopeId) -> Result<(), ServiceError> {
+        policy::check_root(caller_uid)?;
+        self.backend.kill_scope(id)?;
         Ok(())
     }
 }
@@ -116,15 +133,11 @@ mod tests {
     use std::collections::{BTreeSet, HashMap};
     use std::sync::Mutex;
 
-    /// A fake backend over a plain in-memory tree, for policy/plumbing
-    /// tests that don't need real cgroup semantics (membership, kill,
-    /// populated events). See `crate::backend::real` tests and
-    /// `tests/e2e.rs` for those.
     #[derive(Default)]
     struct FakeBackend {
         scopes: Mutex<BTreeSet<ScopeId>>,
-        members: Mutex<HashMap<ScopeId, Vec<Pid>>>,
         pid_scope: Mutex<HashMap<Pid, ScopeId>>,
+        targets: Mutex<HashMap<(ScopeId, TargetId), Pid>>,
     }
 
     impl CgroupBackend for FakeBackend {
@@ -134,25 +147,37 @@ mod tests {
             }
             Ok(())
         }
-        fn exists(&self, id: &ScopeId) -> Result<bool, BackendError> {
-            Ok(self.scopes.lock().unwrap().contains(id))
-        }
-        fn move_pid(&self, pid: Pid, id: &ScopeId) -> Result<(), BackendError> {
+
+        fn move_pid(
+            &self,
+            pid: Pid,
+            id: &ScopeId,
+            target: Option<&TargetId>,
+        ) -> Result<(), BackendError> {
             if !self.scopes.lock().unwrap().contains(id) {
                 return Err(BackendError::NotFound(id.clone()));
             }
             self.pid_scope.lock().unwrap().insert(pid, id.clone());
-            self.members
-                .lock()
-                .unwrap()
-                .entry(id.clone())
-                .or_default()
-                .push(pid);
+            if let Some(target) = target {
+                let key = (id.clone(), target.clone());
+                let mut targets = self.targets.lock().unwrap();
+                if let Some(existing) = targets.get(&key) {
+                    if *existing != pid {
+                        return Err(BackendError::TargetAlreadyExists {
+                            scope: id.clone(),
+                            target: target.clone(),
+                        });
+                    }
+                }
+                targets.insert(key, pid);
+            }
             Ok(())
         }
+
         fn scope_of(&self, pid: Pid) -> Result<Option<ScopeId>, BackendError> {
             Ok(self.pid_scope.lock().unwrap().get(&pid).cloned())
         }
+
         fn list(&self, prefix: &ScopeId) -> Result<Vec<ScopeId>, BackendError> {
             Ok(self
                 .scopes
@@ -163,100 +188,135 @@ mod tests {
                 .cloned()
                 .collect())
         }
-        fn members(&self, id: &ScopeId) -> Result<Vec<Pid>, BackendError> {
+
+        fn target_exists(&self, id: &ScopeId, target: &TargetId) -> Result<bool, BackendError> {
             Ok(self
-                .members
+                .targets
                 .lock()
                 .unwrap()
-                .get(id)
-                .cloned()
-                .unwrap_or_default())
+                .contains_key(&(id.clone(), target.clone())))
         }
-        fn terminate(&self, _id: &ScopeId, _signal: Signal) -> Result<(), BackendError> {
-            Ok(())
-        }
-        fn kill(&self, _id: &ScopeId) -> Result<(), BackendError> {
-            Ok(())
-        }
-        fn is_populated(&self, id: &ScopeId) -> Result<bool, BackendError> {
-            Ok(!self.members(id)?.is_empty())
-        }
-    }
 
-    #[test]
-    fn root_can_create_sessiond_scope() {
-        let svc = Service::new(FakeBackend::default());
-        let id = ScopeId::parse("sessiond/user/1000/service").unwrap();
-        assert!(svc.create(0, &id).is_ok());
-        assert!(svc.create(0, &id).is_err()); // already exists
-        assert!(svc.backend().exists(&id).unwrap());
-    }
-
-    #[test]
-    fn non_root_cannot_create_sessiond_scope() {
-        let svc = Service::new(FakeBackend::default());
-        let id = ScopeId::parse("sessiond/user/1000/service").unwrap();
-        assert!(matches!(
-            svc.create(1000, &id),
-            Err(ServiceError::Policy(PolicyError::AccessDenied))
-        ));
-    }
-
-    #[test]
-    fn non_root_can_create_own_user_scope() {
-        let svc = Service::new(FakeBackend::default());
-        let id = ScopeId::parse("user/1000/sandbox").unwrap();
-        assert!(svc.create(1000, &id).is_ok());
-    }
-
-    #[test]
-    fn non_root_cannot_create_other_user_scope() {
-        let svc = Service::new(FakeBackend::default());
-        let id = ScopeId::parse("user/2000/sandbox").unwrap();
-        assert!(matches!(
-            svc.create(1000, &id),
-            Err(ServiceError::Policy(PolicyError::AccessDenied))
-        ));
-    }
-
-    #[test]
-    fn move_requires_owning_the_process() {
-        let svc = Service::new(FakeBackend::default());
-        let id = ScopeId::parse("user/1000/sandbox").unwrap();
-        svc.create(1000, &id).unwrap();
-
-        let my_pid = std::process::id();
-        let my_uid = nix::unistd::Uid::current().as_raw();
-        if my_uid != 0 {
-            // Caller (uid 1000, hypothetically) does not own the test
-            // runner's own pid unless the runner really is uid 1000.
-            if my_uid != 1000 {
-                assert!(svc.move_pid(1000, my_pid, &id).is_err());
+        fn terminate_target(&self, id: &ScopeId, target: &TargetId) -> Result<(), BackendError> {
+            if self.target_exists(id, target)? {
+                Ok(())
+            } else {
+                Err(BackendError::TargetNotFound {
+                    scope: id.clone(),
+                    target: target.clone(),
+                })
             }
         }
+
+        fn kill_target(&self, id: &ScopeId, target: &TargetId) -> Result<(), BackendError> {
+            self.terminate_target(id, target)
+        }
+
+        fn kill_scope(&self, _id: &ScopeId) -> Result<(), BackendError> {
+            Ok(())
+        }
+
+        fn is_populated(&self, id: &ScopeId) -> Result<bool, BackendError> {
+            Ok(self
+                .pid_scope
+                .lock()
+                .unwrap()
+                .values()
+                .any(|scope| scope.is_or_is_under(id)))
+        }
+    }
+
+    fn ids() -> (ScopeId, TargetId) {
+        (
+            ScopeId::parse("sessiond/user/1000/service").unwrap(),
+            TargetId::parse("manager").unwrap(),
+        )
     }
 
     #[test]
-    fn root_can_move_any_process_anywhere_it_may_address() {
+    fn every_operation_is_root_only() {
         let svc = Service::new(FakeBackend::default());
-        let id = ScopeId::parse("sessiond/user/1000/service").unwrap();
-        svc.create(0, &id).unwrap();
-        assert!(svc.move_pid(0, std::process::id(), &id).is_ok());
-        assert_eq!(svc.scope_of(0, std::process::id()).unwrap(), Some(id));
+        let (scope, target) = ids();
+        assert!(matches!(
+            svc.create(1000, &scope),
+            Err(ServiceError::Policy(PolicyError::AccessDenied))
+        ));
+        assert!(matches!(
+            svc.scope_populated(1000, &scope),
+            Err(ServiceError::Policy(PolicyError::AccessDenied))
+        ));
+        assert!(matches!(
+            svc.target_exists(1000, &scope, &target),
+            Err(ServiceError::Policy(PolicyError::AccessDenied))
+        ));
+        assert!(matches!(
+            svc.move_pid(1000, 42, &scope, Some(&target)),
+            Err(ServiceError::Policy(PolicyError::AccessDenied))
+        ));
+        assert!(matches!(
+            svc.scope_of(1000, 42),
+            Err(ServiceError::Policy(PolicyError::AccessDenied))
+        ));
+        assert!(matches!(
+            svc.list(1000, &scope),
+            Err(ServiceError::Policy(PolicyError::AccessDenied))
+        ));
+        assert!(matches!(
+            svc.terminate_target(1000, &scope, &target),
+            Err(ServiceError::Policy(PolicyError::AccessDenied))
+        ));
+        assert!(matches!(
+            svc.kill_target(1000, &scope, &target),
+            Err(ServiceError::Policy(PolicyError::AccessDenied))
+        ));
+        assert!(matches!(
+            svc.kill_scope(1000, &scope),
+            Err(ServiceError::Policy(PolicyError::AccessDenied))
+        ));
     }
 
     #[test]
-    fn list_excludes_prefix_itself() {
+    fn tracked_move_is_idempotent_for_the_same_process() {
+        let svc = Service::new(FakeBackend::default());
+        let (scope, target) = ids();
+        svc.create(0, &scope).unwrap();
+        svc.move_pid(0, 42, &scope, Some(&target)).unwrap();
+        svc.move_pid(0, 42, &scope, Some(&target)).unwrap();
+        assert!(svc.target_exists(0, &scope, &target).unwrap());
+        assert_eq!(svc.scope_of(0, 42).unwrap(), Some(scope));
+    }
+
+    #[test]
+    fn tracked_move_rejects_a_live_target_collision() {
+        let svc = Service::new(FakeBackend::default());
+        let (scope, target) = ids();
+        svc.create(0, &scope).unwrap();
+        svc.move_pid(0, 42, &scope, Some(&target)).unwrap();
+        assert!(matches!(
+            svc.move_pid(0, 43, &scope, Some(&target)),
+            Err(ServiceError::Backend(
+                BackendError::TargetAlreadyExists { .. }
+            ))
+        ));
+    }
+
+    #[test]
+    fn untracked_move_creates_no_target() {
+        let svc = Service::new(FakeBackend::default());
+        let (scope, target) = ids();
+        svc.create(0, &scope).unwrap();
+        svc.move_pid(0, 42, &scope, None).unwrap();
+        assert!(!svc.target_exists(0, &scope, &target).unwrap());
+        assert!(svc.scope_populated(0, &scope).unwrap());
+    }
+
+    #[test]
+    fn list_excludes_the_prefix() {
         let svc = Service::new(FakeBackend::default());
         let root = ScopeId::parse("sessiond/user/1000/session").unwrap();
+        let child = root.join("abc").unwrap();
         svc.create(0, &root).unwrap();
-        let a = ScopeId::parse("sessiond/user/1000/session/a").unwrap();
-        let b = ScopeId::parse("sessiond/user/1000/session/b").unwrap();
-        svc.create(0, &a).unwrap();
-        svc.create(0, &b).unwrap();
-
-        let mut listed = svc.list(0, &root).unwrap();
-        listed.sort();
-        assert_eq!(listed, vec![a, b]);
+        svc.create(0, &child).unwrap();
+        assert_eq!(svc.list(0, &root).unwrap(), vec![child]);
     }
 }

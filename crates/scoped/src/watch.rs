@@ -1,14 +1,12 @@
 //! Background empty-scope watching and garbage collection.
 //!
-//! "State lives entirely in the cgroup tree" (per the plan) means `scoped`
-//! keeps nothing durable in memory. The one thing it *does* keep in memory
-//! is this module's bookkeeping -- which scopes have a watcher thread, and
-//! whether each has ever been populated -- and that's fine, because
-//! [`Watchers::startup_scan`] can always rebuild it from the tree alone.
+//! Durable state lives in the cgroup tree: scope directories plus target
+//! xattrs. This module only caches watcher bookkeeping and pidfds; startup
+//! reconstructs both scope and target watchers from that tree.
 
-use crate::backend::RealBackend;
+use crate::backend::{BackendError, ProcessIdentity, RealBackend, TargetStatus};
 use crate::dbus::Manager;
-use scope_id::ScopeId;
+use scope_id::{ScopeId, TargetId};
 use std::collections::HashMap;
 use std::fs::File;
 use std::os::fd::AsFd;
@@ -53,11 +51,10 @@ struct Inner {
     backend: Arc<RealBackend>,
     connection: Connection,
     object_path: OwnedObjectPath,
-    // The `AtomicBool` lets a watcher thread be asked to stop; nothing
-    // sets it yet (no graceful-shutdown path exists until SIGTERM handling
-    // lands, see the TODO in main.rs), so it's effectively always `false`
-    // today, but `run` already honors it correctly.
-    handles: Mutex<HashMap<ScopeId, Arc<AtomicBool>>>,
+    // Scope stops are not wired to daemon shutdown yet. Target stops are
+    // used immediately when the same `(scope, target)` binding is replaced.
+    scope_handles: Mutex<HashMap<ScopeId, Arc<AtomicBool>>>,
+    target_handles: Mutex<HashMap<(ScopeId, TargetId), Arc<AtomicBool>>>,
 }
 
 impl Watchers {
@@ -70,7 +67,8 @@ impl Watchers {
             backend,
             connection,
             object_path,
-            handles: Mutex::new(HashMap::new()),
+            scope_handles: Mutex::new(HashMap::new()),
+            target_handles: Mutex::new(HashMap::new()),
         }))
     }
 
@@ -80,10 +78,40 @@ impl Watchers {
         self.spawn(id, false);
     }
 
+    /// Starts (or replaces) the pidfd watcher for a tracked target. Replacing
+    /// the map entry before stopping the old thread gives every binding a
+    /// generation: a delayed watcher can never remove or emit for a newer
+    /// process that reused the same target ID.
+    pub fn watch_target(&self, id: ScopeId, target: TargetId) {
+        let stop = Arc::new(AtomicBool::new(false));
+        let key = (id.clone(), target.clone());
+        if let Some(old) = self
+            .0
+            .target_handles
+            .lock()
+            .unwrap()
+            .insert(key, stop.clone())
+        {
+            old.store(true, Ordering::Relaxed);
+        }
+        let this = self.clone();
+        let thread_name = format!("scoped-target-{id}-{target}");
+        let thread_id = id.clone();
+        let thread_target = target.clone();
+        let thread_stop = stop.clone();
+        let built = thread::Builder::new().name(thread_name).spawn(move || {
+            this.run_target(thread_id, thread_target, thread_stop);
+        });
+        if let Err(e) = built {
+            tracing::error!(%id, %target, error = %e, "failed to spawn target watcher thread");
+            self.forget_target_if_current(&id, &target, &stop);
+        }
+    }
+
     fn spawn(&self, id: ScopeId, seen_populated: bool) {
         let stop = Arc::new(AtomicBool::new(false));
         {
-            let mut handles = self.0.handles.lock().unwrap();
+            let mut handles = self.0.scope_handles.lock().unwrap();
             if handles.contains_key(&id) {
                 return; // already watched (startup scan racing a Create, belt and suspenders)
             }
@@ -91,11 +119,14 @@ impl Watchers {
         }
         let this = self.clone();
         let thread_name = format!("scoped-watch-{id}");
+        let thread_id = id.clone();
+        let thread_stop = stop.clone();
         let built = thread::Builder::new().name(thread_name).spawn(move || {
-            this.run(id, seen_populated, stop);
+            this.run(thread_id, seen_populated, thread_stop);
         });
         if let Err(e) = built {
-            tracing::error!(error = %e, "failed to spawn scope watcher thread");
+            tracing::error!(%id, error = %e, "failed to spawn scope watcher thread");
+            self.forget(&id);
         }
     }
 
@@ -138,7 +169,95 @@ impl Watchers {
     }
 
     fn forget(&self, id: &ScopeId) {
-        self.0.handles.lock().unwrap().remove(id);
+        self.0.scope_handles.lock().unwrap().remove(id);
+    }
+
+    fn run_target(&self, id: ScopeId, target: TargetId, stop: Arc<AtomicBool>) {
+        let handle = match self.0.backend.target_status(&id, &target) {
+            Ok(TargetStatus::Live(handle)) => handle,
+            Ok(TargetStatus::Gone) => {
+                let _ = self.0.backend.remove_stale_target(&id, &target);
+                self.finish_target(&id, &target, &stop, None);
+                return;
+            }
+            Ok(TargetStatus::Missing) | Err(BackendError::NotFound(_)) => {
+                self.finish_target(&id, &target, &stop, None);
+                return;
+            }
+            Err(e) => {
+                tracing::warn!(%id, %target, error = %e, "failed to open tracked target");
+                self.forget_target_if_current(&id, &target, &stop);
+                return;
+            }
+        };
+        let identity = handle.identity();
+        loop {
+            if stop.load(Ordering::Relaxed) {
+                return;
+            }
+            let mut fds = [PollFd::new(handle.as_fd(), PollFlags::POLLIN)];
+            let timeout = PollTimeout::try_from(POLL_INTERVAL).unwrap_or(PollTimeout::MAX);
+            let ready = poll(&mut fds, timeout).unwrap_or(0);
+            if stop.load(Ordering::Relaxed) {
+                return;
+            }
+            if ready > 0 {
+                self.finish_target(&id, &target, &stop, Some(identity));
+                return;
+            }
+            // The pidfd only reports process exit. A target can also become
+            // invalid because scoped moved it to another scope, so verify the
+            // durable binding on the same safety-net interval.
+            match self.0.backend.target_status(&id, &target) {
+                Ok(TargetStatus::Live(current)) if current.identity() == identity => {}
+                Ok(_) | Err(BackendError::NotFound(_)) => {
+                    self.finish_target(&id, &target, &stop, Some(identity));
+                    return;
+                }
+                Err(e) => {
+                    tracing::warn!(%id, %target, error = %e, "failed to revalidate tracked target");
+                }
+            }
+        }
+    }
+
+    fn forget_target_if_current(
+        &self,
+        id: &ScopeId,
+        target: &TargetId,
+        stop: &Arc<AtomicBool>,
+    ) -> bool {
+        let key = (id.clone(), target.clone());
+        let mut handles = self.0.target_handles.lock().unwrap();
+        if handles
+            .get(&key)
+            .is_some_and(|current| Arc::ptr_eq(current, stop))
+        {
+            handles.remove(&key);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn finish_target(
+        &self,
+        id: &ScopeId,
+        target: &TargetId,
+        stop: &Arc<AtomicBool>,
+        identity: Option<ProcessIdentity>,
+    ) {
+        if !self.forget_target_if_current(id, target, stop) {
+            return;
+        }
+        if let Some(identity) = identity {
+            if let Err(e) = self.0.backend.remove_target_if(id, target, identity) {
+                // The cgroup may already have been reclaimed; TargetGone is
+                // still the correct event for the watcher generation.
+                tracing::debug!(%id, %target, error = %e, "target record was already unavailable");
+            }
+        }
+        self.emit_target_gone_blocking(id, target);
     }
 
     fn handle_empty(&self, id: &ScopeId, path: &Path) {
@@ -178,6 +297,17 @@ impl Watchers {
         }
     }
 
+    async fn emit_target_gone(&self, id: &ScopeId, target: &TargetId) {
+        let Some(emitter) = self.emitter(id) else {
+            return;
+        };
+        let id_str = id.to_string();
+        let target_str = target.to_string();
+        if let Err(e) = Manager::target_gone(&emitter, &id_str, &target_str).await {
+            tracing::warn!(%id, %target, error = %e, "failed to emit TargetGone");
+        }
+    }
+
     async fn emit_empty(&self, id: &ScopeId) {
         let Some(emitter) = self.emitter(id) else {
             return;
@@ -204,6 +334,10 @@ impl Watchers {
     // `startup_scan`, which runs as part of `main`'s top-level future) must
     // use the `async` forms instead: `zbus::block_on` panics outright when
     // called from a task the runtime is driving.
+
+    fn emit_target_gone_blocking(&self, id: &ScopeId, target: &TargetId) {
+        zbus::block_on(self.emit_target_gone(id, target));
+    }
 
     fn emit_empty_blocking(&self, id: &ScopeId) {
         zbus::block_on(self.emit_empty(id));
@@ -244,6 +378,20 @@ impl Watchers {
     fn scan_dir(&self, dir: &Path, removed: &mut Vec<ScopeId>) -> bool {
         let base = self.0.backend.base();
         let is_root = dir == base.as_path();
+        if !is_root {
+            if let Some(id) = self.0.backend.id_for_path(dir) {
+                match self.0.backend.target_ids(&id) {
+                    Ok(targets) => {
+                        for target in targets {
+                            self.watch_target(id.clone(), target);
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(%id, error = %e, "failed to recover tracked targets");
+                    }
+                }
+            }
+        }
         let children = RealBackend::subdirs(dir).unwrap_or_default();
         let mut all_children_gone = true;
         for name in &children {

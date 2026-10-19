@@ -1,7 +1,7 @@
 [package]
 name = "scoped"
 version = "0.1.0"
-description = "D-Bus scope manager: cgroup v2 membership, termination and kill, by scope ID"
+description = "Root-only D-Bus scope manager with cgroup v2 and pidfd-tracked targets"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -15,6 +15,8 @@ scope-id = { path = "../scope-id" }
 zbus = "6"
 clap = { version = "4", features = ["derive"] }
 nix = { version = "0.30", features = ["signal", "poll", "fs", "process", "user"] }
+rustix = { version = "1", features = ["process"] }
+xattr = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 thiserror = "2"

@@ -1,7 +1,8 @@
 //! End-to-end tests against a real cgroup v2 filesystem and a real D-Bus
-//! daemon: `M0`'s acceptance criteria ("create, move, terminate, kill and
-//! the empty event work; policy enforced; survives a restart") exercised
-//! through the actual `scoped` binary, not the library-level fakes the
+//! daemon: root-only policy, tracked/untracked moves, exact pidfd target
+//! termination, whole-scope kill, target/scope lifecycle signals, and
+//! restart reconstruction exercised through the actual `scoped` binary,
+//! not the library-level fakes the
 //! unit tests elsewhere in this crate use.
 //!
 //! Each case is hermetic: it spawns its own `dbus-daemon` on a private
@@ -11,7 +12,7 @@
 //! disturb a `scoped` already running on the machine.
 //!
 //! Requires root (creating/moving/killing real cgroups, and the
-//! process-ownership checks that depend on real uids), a cgroup2 mount at
+//! root-only caller checks), a cgroup2 mount at
 //! `/sys/fs/cgroup` (override with `SCOPED_E2E_CGROUP_MOUNT`), and
 //! `dbus-daemon` on `PATH`.
 //!
@@ -43,15 +44,24 @@ trait Manager {
     async fn create(&self, id: &str) -> zbus::Result<()>;
 
     #[zbus(name = "Move")]
-    async fn move_pid(&self, pid: u32, id: &str) -> zbus::Result<()>;
+    async fn move_pid(&self, pid: u32, id: &str, target_id: &str) -> zbus::Result<()>;
 
     async fn scope_of(&self, pid: u32) -> zbus::Result<String>;
 
     async fn list(&self, prefix: &str) -> zbus::Result<Vec<String>>;
 
-    async fn terminate(&self, id: &str, signal: i32) -> zbus::Result<()>;
+    async fn target_exists(&self, id: &str, target_id: &str) -> zbus::Result<bool>;
 
-    async fn kill(&self, id: &str) -> zbus::Result<()>;
+    async fn scope_populated(&self, id: &str) -> zbus::Result<bool>;
+
+    async fn terminate_target(&self, id: &str, target_id: &str) -> zbus::Result<()>;
+
+    async fn kill_target(&self, id: &str, target_id: &str) -> zbus::Result<()>;
+
+    async fn kill_scope(&self, id: &str) -> zbus::Result<()>;
+
+    #[zbus(signal)]
+    fn target_gone(&self, id: String, target_id: String) -> zbus::Result<()>;
 
     #[zbus(signal)]
     fn scope_empty(&self, id: String) -> zbus::Result<()>;
@@ -61,6 +71,7 @@ trait Manager {
 }
 
 const SIGTERM: i32 = 15;
+const SIGKILL: i32 = 9;
 /// The uid the policy tests make their "unprivileged caller" calls as.
 const NOBODY: u32 = 65534;
 
@@ -385,10 +396,10 @@ fn busctl_call_as(bus: &TestBus, uid: u32, args: &[&str]) -> (bool, String) {
 
 #[test]
 #[ignore]
-fn create_move_list_scope_of_and_graceful_terminate() {
+fn tracked_target_exit_precedes_scope_drain() {
     require_root();
     let _wd = Watchdog::start(
-        "create_move_list_scope_of_and_graceful_terminate",
+        "tracked_target_exit_precedes_scope_drain",
         Duration::from_secs(60),
     );
     let bus = TestBus::start();
@@ -397,122 +408,131 @@ fn create_move_list_scope_of_and_graceful_terminate() {
     zbus::block_on(async {
         let connection = bus.connect().await;
         let proxy = wait_for_manager(&connection).await;
-
         let prefix = "sessiond/user/0/session";
         let id = format!("{prefix}/{}", unique("sess"));
-
         proxy.create(&id).await.expect("Create");
-        assert!(
-            scoped.scope_path(&id).is_dir(),
-            "scope directory should exist after Create"
-        );
 
-        // Exits cleanly on SIGTERM.
-        let mut member = Member::spawn(&["sleep", "300"]);
-        let pid = member.pid();
-
-        proxy.move_pid(pid, &id).await.expect("Move");
-        assert_eq!(proxy.scope_of(pid).await.expect("ScopeOf"), id);
-
-        let listed = proxy.list(prefix).await.expect("List");
-        assert!(listed.contains(&id), "List({prefix}) should include {id}");
-        assert!(
-            !listed.contains(&prefix.to_string()),
-            "List must not include the prefix itself, got {listed:?}"
-        );
-
-        let mut empty = proxy
-            .receive_scope_empty()
+        let mut manager = Member::spawn(&["sleep", "300"]);
+        let mut leftover = Member::spawn(&["sleep", "300"]);
+        proxy
+            .move_pid(manager.pid(), &id, "manager")
             .await
-            .expect("receive_scope_empty");
-        let mut removed = proxy
-            .receive_scope_removed()
+            .expect("tracked Move");
+        let collision = proxy
+            .move_pid(leftover.pid(), &id, "manager")
             .await
-            .expect("receive_scope_removed");
-
-        proxy.terminate(&id, SIGTERM).await.expect("Terminate");
-
-        let empty_signal = empty.next().await.expect("ScopeEmpty stream ended");
-        assert_eq!(empty_signal.args().unwrap().id, id);
-
-        let removed_signal = removed.next().await.expect("ScopeRemoved stream ended");
-        assert_eq!(removed_signal.args().unwrap().id, id);
-
+            .expect_err("a live target ID must not be rebound");
         assert!(
-            !scoped.scope_path(&id).exists(),
-            "scope directory should be gone after ScopeRemoved"
+            collision.to_string().contains("TargetAlreadyExists"),
+            "unexpected collision error: {collision}"
         );
-        let status = member
-            .wait_for_exit(Duration::from_secs(5))
-            .expect("SIGTERM'd member should have exited");
+        proxy
+            .move_pid(leftover.pid(), &id, "")
+            .await
+            .expect("untracked Move");
+
+        assert_eq!(proxy.scope_of(manager.pid()).await.unwrap(), id);
+        assert!(proxy.target_exists(&id, "manager").await.unwrap());
+        assert!(proxy.scope_populated(&id).await.unwrap());
+        assert!(proxy.list(prefix).await.unwrap().contains(&id));
+        assert!(
+            xattr::get(scoped.scope_path(&id), "user.scoped.target.manager")
+                .unwrap()
+                .is_some()
+        );
+
+        // Arm every stream before the operation, as sessiond will.
+        let mut target_gone = proxy.receive_target_gone().await.unwrap();
+        let mut empty = proxy.receive_scope_empty().await.unwrap();
+        let mut removed = proxy.receive_scope_removed().await.unwrap();
+
+        proxy
+            .terminate_target(&id, "manager")
+            .await
+            .expect("TerminateTarget");
+        let gone = target_gone.next().await.expect("TargetGone");
+        let args = gone.args().unwrap();
+        assert_eq!(args.id, id);
+        assert_eq!(args.target_id, "manager");
         assert_eq!(
-            status.signal(),
-            Some(SIGTERM),
-            "member should have died to SIGTERM, not something else"
+            manager
+                .wait_for_exit(Duration::from_secs(5))
+                .expect("manager exits")
+                .signal(),
+            Some(SIGTERM)
         );
 
-        // The now-childless ancestors should have been cascaded away too,
-        // right up to (but not including) the managed root.
-        assert!(
-            !scoped.scope_path(prefix).exists(),
-            "empty ancestor directories should be cascaded away"
+        // Target death is not scope emptiness: the untracked child remains.
+        assert!(!proxy.target_exists(&id, "manager").await.unwrap());
+        assert!(proxy.scope_populated(&id).await.unwrap());
+        assert!(leftover.wait_for_exit(Duration::from_millis(100)).is_none());
+
+        proxy.kill_scope(&id).await.expect("KillScope");
+        assert_eq!(empty.next().await.unwrap().args().unwrap().id, id);
+        assert_eq!(removed.next().await.unwrap().args().unwrap().id, id);
+        assert_eq!(
+            leftover
+                .wait_for_exit(Duration::from_secs(5))
+                .expect("leftover killed")
+                .signal(),
+            Some(SIGKILL)
         );
-        assert!(
-            scoped.base_path().is_dir(),
-            "the managed root itself must survive"
-        );
+        assert!(!proxy.scope_populated(&id).await.unwrap());
+        assert!(!scoped.scope_path(&id).exists());
+        proxy
+            .kill_scope(&id)
+            .await
+            .expect("KillScope is idempotent after removal");
     });
 }
 
 #[test]
 #[ignore]
-fn kill_is_forceful_even_against_a_sigterm_trap() {
+fn kill_target_is_exact_and_forceful() {
     require_root();
-    let _wd = Watchdog::start(
-        "kill_is_forceful_even_against_a_sigterm_trap",
-        Duration::from_secs(60),
-    );
+    let _wd = Watchdog::start("kill_target_is_exact_and_forceful", Duration::from_secs(60));
     let bus = TestBus::start();
     let scoped = ScopedProcess::spawn(&bus, &unique("scoped-e2e"));
 
     zbus::block_on(async {
         let connection = bus.connect().await;
         let proxy = wait_for_manager(&connection).await;
-
         let id = format!("sessiond/user/0/session/{}", unique("sess"));
-        proxy.create(&id).await.expect("Create");
+        proxy.create(&id).await.unwrap();
 
-        // Ignores SIGTERM; only SIGKILL (via cgroup.kill) can end it.
-        let mut member = Member::spawn(&["sh", "-c", "trap '' TERM; sleep 300"]);
-        proxy.move_pid(member.pid(), &id).await.expect("Move");
+        let mut manager = Member::spawn(&["sh", "-c", "trap '' TERM; sleep 300"]);
+        let mut leftover = Member::spawn(&["sleep", "300"]);
+        proxy.move_pid(manager.pid(), &id, "manager").await.unwrap();
+        proxy.move_pid(leftover.pid(), &id, "").await.unwrap();
 
-        // Prove the trap works: a graceful Terminate must leave it running.
-        proxy.terminate(&id, SIGTERM).await.expect("Terminate");
-        assert!(
-            member.wait_for_exit(Duration::from_secs(2)).is_none(),
-            "the SIGTERM-trapping member was supposed to survive Terminate"
-        );
-        assert!(
-            scoped.scope_path(&id).is_dir(),
-            "scope should still exist while a member survives"
-        );
+        proxy.terminate_target(&id, "manager").await.unwrap();
+        assert!(manager.wait_for_exit(Duration::from_secs(2)).is_none());
 
-        let mut removed = proxy
-            .receive_scope_removed()
-            .await
-            .expect("receive_scope_removed");
-
-        proxy.kill(&id).await.expect("Kill");
-
-        removed.next().await.expect("ScopeRemoved stream ended");
-
-        let status = member
-            .wait_for_exit(Duration::from_secs(5))
-            .expect("Kill should have ended the member");
+        let mut gone = proxy.receive_target_gone().await.unwrap();
+        proxy.kill_target(&id, "manager").await.unwrap();
         assert_eq!(
-            status.signal(),
-            Some(9),
-            "Kill should SIGKILL regardless of the member's SIGTERM trap"
+            gone.next().await.unwrap().args().unwrap().target_id,
+            "manager"
+        );
+        assert_eq!(
+            manager
+                .wait_for_exit(Duration::from_secs(5))
+                .expect("target killed")
+                .signal(),
+            Some(SIGKILL)
+        );
+        assert!(leftover.wait_for_exit(Duration::from_millis(100)).is_none());
+        assert!(proxy.scope_populated(&id).await.unwrap());
+
+        let mut removed = proxy.receive_scope_removed().await.unwrap();
+        proxy.kill_scope(&id).await.unwrap();
+        removed.next().await.expect("ScopeRemoved");
+        assert_eq!(
+            leftover
+                .wait_for_exit(Duration::from_secs(5))
+                .expect("scope killed")
+                .signal(),
+            Some(SIGKILL)
         );
         assert!(!scoped.scope_path(&id).exists());
     });
@@ -520,10 +540,56 @@ fn kill_is_forceful_even_against_a_sigterm_trap() {
 
 #[test]
 #[ignore]
-fn an_unprivileged_caller_is_confined_to_its_own_namespace() {
+fn moving_a_target_out_emits_target_gone() {
     require_root();
     let _wd = Watchdog::start(
-        "an_unprivileged_caller_is_confined_to_its_own_namespace",
+        "moving_a_target_out_emits_target_gone",
+        Duration::from_secs(60),
+    );
+    let bus = TestBus::start();
+    let scoped = ScopedProcess::spawn(&bus, &unique("scoped-e2e"));
+
+    zbus::block_on(async {
+        let connection = bus.connect().await;
+        let proxy = wait_for_manager(&connection).await;
+        let from = format!("sessiond/user/0/session/{}", unique("from"));
+        let to = format!("sessiond/user/0/session/{}", unique("to"));
+        proxy.create(&from).await.unwrap();
+        proxy.create(&to).await.unwrap();
+        let mut member = Member::spawn(&["sleep", "300"]);
+        proxy.move_pid(member.pid(), &from, "main").await.unwrap();
+
+        let mut gone = proxy.receive_target_gone().await.unwrap();
+        proxy
+            .move_pid(member.pid(), &to, "replacement")
+            .await
+            .unwrap();
+        assert!(!proxy.target_exists(&from, "main").await.unwrap());
+        assert!(proxy.target_exists(&to, "replacement").await.unwrap());
+
+        let signal = gone.next().await.expect("old target should become gone");
+        let args = signal.args().unwrap();
+        assert_eq!(args.id, from);
+        assert_eq!(args.target_id, "main");
+
+        proxy.kill_scope(&to).await.unwrap();
+        assert_eq!(
+            member
+                .wait_for_exit(Duration::from_secs(5))
+                .expect("member killed")
+                .signal(),
+            Some(SIGKILL)
+        );
+        assert!(!scoped.scope_path(&from).exists());
+    });
+}
+
+#[test]
+#[ignore]
+fn every_unprivileged_caller_is_denied() {
+    require_root();
+    let _wd = Watchdog::start(
+        "every_unprivileged_caller_is_denied",
         Duration::from_secs(60),
     );
     let bus = TestBus::start();
@@ -534,154 +600,77 @@ fn an_unprivileged_caller_is_confined_to_its_own_namespace() {
         wait_for_manager(&connection).await;
     });
 
-    // Denied: the sessiond/ namespace is root-only.
-    let forbidden = "sessiond/user/0/session/should-be-denied";
-    let (ok, stderr) = busctl_call_as(&bus, NOBODY, &["Create", "s", forbidden]);
-    assert!(
-        !ok,
-        "an unprivileged caller must not create a sessiond scope"
-    );
-    assert!(
-        stderr.contains("Access denied") || stderr.contains("AccessDenied"),
-        "expected an AccessDenied error, got: {stderr}"
-    );
-    assert!(
-        !scoped.scope_path(forbidden).exists(),
-        "the denied scope must not have been created"
-    );
-
-    // Denied: another uid's namespace.
-    let other = "user/1234/not-mine";
-    let (ok, stderr) = busctl_call_as(&bus, NOBODY, &["Create", "s", other]);
-    assert!(
-        !ok,
-        "an unprivileged caller must not touch another uid's scopes"
-    );
-    assert!(
-        stderr.contains("Access denied") || stderr.contains("AccessDenied"),
-        "expected an AccessDenied error, got: {stderr}"
-    );
-
-    // Allowed: its own namespace. This is what proves the rejections above
-    // came from scoped's uid policy and not from the bus refusing to route
-    // the call at all.
-    let own = format!("user/{NOBODY}/mine");
-    let (ok, stderr) = busctl_call_as(&bus, NOBODY, &["Create", "s", &own]);
-    assert!(
-        ok,
-        "an unprivileged caller may create its own scope: {stderr}"
-    );
-    assert!(scoped.scope_path(&own).is_dir());
-
-    // Denied: moving a process it does not own (pid 1 is root's).
-    let (ok, stderr) = busctl_call_as(&bus, NOBODY, &["Move", "us", "1", &own]);
-    assert!(
-        !ok,
-        "an unprivileged caller must not move a process it doesn't own"
-    );
-    assert!(
-        stderr.contains("Access denied") || stderr.contains("AccessDenied"),
-        "expected an AccessDenied error, got: {stderr}"
-    );
-    assert_eq!(
-        std::fs::read_to_string(scoped.scope_path(&own).join("cgroup.procs"))
-            .expect("read cgroup.procs")
-            .trim(),
-        "",
-        "the denied Move must not have happened"
-    );
+    // The private bus routes this call; scoped itself must reject it.
+    for id in [
+        "sessiond/user/0/session/denied",
+        &format!("user/{NOBODY}/also-denied"),
+    ] {
+        let (ok, stderr) = busctl_call_as(&bus, NOBODY, &["Create", "s", id]);
+        assert!(!ok, "non-root Create unexpectedly succeeded");
+        assert!(
+            stderr.contains("Access denied")
+                || stderr.contains("AccessDenied")
+                || stderr.contains("root-only"),
+            "expected root-only AccessDenied, got: {stderr}"
+        );
+        assert!(!scoped.scope_path(id).exists());
+    }
 }
 
 #[test]
 #[ignore]
-fn restart_sweeps_never_populated_scopes_and_keeps_watching_populated_ones() {
+fn restart_recovers_targets_and_scope_watchers() {
     require_root();
     let _wd = Watchdog::start(
-        "restart_sweeps_never_populated_scopes_and_keeps_watching_populated_ones",
+        "restart_recovers_targets_and_scope_watchers",
         Duration::from_secs(90),
     );
     let bus = TestBus::start();
     let scope_root = unique("scoped-e2e-restart");
     let mut scoped = ScopedProcess::spawn(&bus, &scope_root);
-
     let populated_id = format!("sessiond/user/0/session/{}", unique("populated"));
     let empty_id = format!("sessiond/user/0/session/{}", unique("empty"));
 
     let mut member = zbus::block_on(async {
         let connection = bus.connect().await;
         let proxy = wait_for_manager(&connection).await;
-
-        proxy.create(&populated_id).await.expect("Create populated");
+        proxy.create(&populated_id).await.unwrap();
         let member = Member::spawn(&["sleep", "300"]);
         proxy
-            .move_pid(member.pid(), &populated_id)
+            .move_pid(member.pid(), &populated_id, "manager")
             .await
-            .expect("Move into populated");
-
-        // Created, but nothing ever moved into it: on disk this is
-        // indistinguishable from a scope whose Move() never landed before
-        // a crash.
-        proxy.create(&empty_id).await.expect("Create empty");
+            .unwrap();
+        proxy.create(&empty_id).await.unwrap();
         member
     });
 
+    scoped.crash();
     assert!(scoped.scope_path(&populated_id).is_dir());
     assert!(scoped.scope_path(&empty_id).is_dir());
-
-    // Simulate a crash: no graceful shutdown, nothing cleaned up.
-    scoped.crash();
-    assert!(
-        scoped.scope_path(&populated_id).is_dir(),
-        "a crash must not touch the cgroup tree"
-    );
-    assert!(scoped.scope_path(&empty_id).is_dir());
-
-    // Restart against the same scope root.
     let scoped_b = ScopedProcess::spawn(&bus, &scope_root);
 
     zbus::block_on(async {
         let connection = bus.connect().await;
         let proxy = wait_for_manager(&connection).await;
+        assert!(!scoped_b.scope_path(&empty_id).exists());
+        assert!(scoped_b.scope_path(&populated_id).is_dir());
+        assert!(proxy.target_exists(&populated_id, "manager").await.unwrap());
 
-        // The startup sweep runs to completion before the name is taken,
-        // so by the time the proxy is usable the tree is already settled:
-        // no sleep-and-hope here.
-        assert!(
-            !scoped_b.scope_path(&empty_id).exists(),
-            "a never-populated scope must be swept on restart (accepted limitation)"
+        let mut gone = proxy.receive_target_gone().await.unwrap();
+        let mut empty = proxy.receive_scope_empty().await.unwrap();
+        let mut removed = proxy.receive_scope_removed().await.unwrap();
+        member.0.kill().unwrap();
+        member.0.wait().unwrap();
+
+        let gone_signal = gone.next().await.unwrap();
+        let args = gone_signal.args().unwrap();
+        assert_eq!(args.id, populated_id);
+        assert_eq!(args.target_id, "manager");
+        assert_eq!(empty.next().await.unwrap().args().unwrap().id, populated_id);
+        assert_eq!(
+            removed.next().await.unwrap().args().unwrap().id,
+            populated_id
         );
-        assert!(
-            scoped_b.scope_path(&populated_id).is_dir(),
-            "a populated scope must survive a restart"
-        );
-
-        // The watcher must have been re-established: killing the member
-        // from outside the API still has to produce ScopeEmpty +
-        // ScopeRemoved.
-        let mut empty = proxy
-            .receive_scope_empty()
-            .await
-            .expect("receive_scope_empty");
-        let mut removed = proxy
-            .receive_scope_removed()
-            .await
-            .expect("receive_scope_removed");
-
-        drop(member.0.kill());
-        let _ = member.0.wait();
-
-        let empty_signal = empty
-            .next()
-            .await
-            .expect("ScopeEmpty stream ended after restart");
-        assert_eq!(empty_signal.args().unwrap().id, populated_id);
-
-        let removed_signal = removed
-            .next()
-            .await
-            .expect("ScopeRemoved stream ended after restart");
-        assert_eq!(removed_signal.args().unwrap().id, populated_id);
-
         assert!(!scoped_b.scope_path(&populated_id).exists());
     });
 }
