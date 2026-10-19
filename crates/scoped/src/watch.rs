@@ -53,6 +53,10 @@ struct Inner {
     backend: Arc<RealBackend>,
     connection: Connection,
     object_path: OwnedObjectPath,
+    // The `AtomicBool` lets a watcher thread be asked to stop; nothing
+    // sets it yet (no graceful-shutdown path exists until SIGTERM handling
+    // lands, see the TODO in main.rs), so it's effectively always `false`
+    // today, but `run` already honors it correctly.
     handles: Mutex<HashMap<ScopeId, Arc<AtomicBool>>>,
 }
 
