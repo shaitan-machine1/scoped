@@ -17,8 +17,14 @@ use watch::Watchers;
 fn main() -> ExitCode {
     let config = Config::parse();
 
+    // Without an explicit default, an unset RUST_LOG means "error only",
+    // which leaves a supervised daemon with an empty log and nothing to
+    // diagnose a live failure with.
     tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "scoped=info".into()),
+        )
         .init();
 
     match zbus::block_on(run(config)) {
