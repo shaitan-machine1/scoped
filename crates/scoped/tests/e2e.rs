@@ -1,7 +1,8 @@
 //! End-to-end tests against a real cgroup v2 filesystem and a real D-Bus
 //! daemon: root-only policy, tracked/untracked moves, exact pidfd target
-//! termination, whole-scope kill, target/scope lifecycle signals, and
-//! restart reconstruction exercised through the actual `scoped` binary,
+//! termination, frozen whole-scope termination and whole-scope kill,
+//! target/scope lifecycle signals, and restart reconstruction exercised
+//! through the actual `scoped` binary,
 //! not the library-level fakes the
 //! unit tests elsewhere in this crate use.
 //!
@@ -57,6 +58,8 @@ trait Manager {
     async fn terminate_target(&self, id: &str, target_id: &str) -> zbus::Result<()>;
 
     async fn kill_target(&self, id: &str, target_id: &str) -> zbus::Result<()>;
+
+    async fn terminate_scope(&self, id: &str) -> zbus::Result<()>;
 
     async fn kill_scope(&self, id: &str) -> zbus::Result<()>;
 
@@ -483,6 +486,78 @@ fn tracked_target_exit_precedes_scope_drain() {
             .kill_scope(&id)
             .await
             .expect("KillScope is idempotent after removal");
+    });
+}
+
+#[test]
+#[ignore]
+fn terminate_scope_signals_descendants_and_always_thaws() {
+    require_root();
+    let _wd = Watchdog::start(
+        "terminate_scope_signals_descendants_and_always_thaws",
+        Duration::from_secs(60),
+    );
+    let bus = TestBus::start();
+    let scoped = ScopedProcess::spawn(&bus, &unique("scoped-e2e"));
+
+    zbus::block_on(async {
+        let connection = bus.connect().await;
+        let proxy = wait_for_manager(&connection).await;
+        let parent = format!("sessiond/user/0/session/{}", unique("parent"));
+        let normal_scope = format!("{parent}/normal");
+        let stubborn_scope = format!("{parent}/stubborn");
+        proxy.create(&normal_scope).await.unwrap();
+        proxy.create(&stubborn_scope).await.unwrap();
+
+        let mut normal = Member::spawn(&["sleep", "300"]);
+        let mut stubborn = Member::spawn(&["sh", "-c", "trap '' TERM; exec sleep 300"]);
+        proxy
+            .move_pid(normal.pid(), &normal_scope, "")
+            .await
+            .unwrap();
+        proxy
+            .move_pid(stubborn.pid(), &stubborn_scope, "")
+            .await
+            .unwrap();
+
+        proxy
+            .terminate_scope(&parent)
+            .await
+            .expect("TerminateScope");
+        assert_eq!(
+            std::fs::read_to_string(scoped.scope_path(&parent).join("cgroup.freeze"))
+                .unwrap()
+                .trim(),
+            "0",
+            "TerminateScope must thaw before replying"
+        );
+        assert_eq!(
+            normal
+                .wait_for_exit(Duration::from_secs(5))
+                .expect("normal member handles SIGTERM")
+                .signal(),
+            Some(SIGTERM)
+        );
+        assert!(
+            stubborn.wait_for_exit(Duration::from_millis(200)).is_none(),
+            "SIGTERM-ignoring member should remain for escalation"
+        );
+
+        proxy
+            .kill_scope(&parent)
+            .await
+            .expect("KillScope escalation");
+        assert_eq!(
+            stubborn
+                .wait_for_exit(Duration::from_secs(5))
+                .expect("stubborn member killed")
+                .signal(),
+            Some(SIGKILL)
+        );
+        proxy
+            .terminate_scope(&parent)
+            .await
+            .expect("TerminateScope is idempotent after removal");
     });
 }
 

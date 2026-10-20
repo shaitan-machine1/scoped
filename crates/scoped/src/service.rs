@@ -120,6 +120,12 @@ impl<B: CgroupBackend> Service<B> {
         Ok(())
     }
 
+    pub fn terminate_scope(&self, caller_uid: u32, id: &ScopeId) -> Result<(), ServiceError> {
+        policy::check_root(caller_uid)?;
+        self.backend.terminate_scope(id)?;
+        Ok(())
+    }
+
     pub fn kill_scope(&self, caller_uid: u32, id: &ScopeId) -> Result<(), ServiceError> {
         policy::check_root(caller_uid)?;
         self.backend.kill_scope(id)?;
@@ -212,6 +218,10 @@ mod tests {
             self.terminate_target(id, target)
         }
 
+        fn terminate_scope(&self, _id: &ScopeId) -> Result<(), BackendError> {
+            Ok(())
+        }
+
         fn kill_scope(&self, _id: &ScopeId) -> Result<(), BackendError> {
             Ok(())
         }
@@ -267,6 +277,10 @@ mod tests {
         ));
         assert!(matches!(
             svc.kill_target(1000, &scope, &target),
+            Err(ServiceError::Policy(PolicyError::AccessDenied))
+        ));
+        assert!(matches!(
+            svc.terminate_scope(1000, &scope),
             Err(ServiceError::Policy(PolicyError::AccessDenied))
         ));
         assert!(matches!(

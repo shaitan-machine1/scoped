@@ -111,6 +111,11 @@ pub trait CgroupBackend: Send + Sync + 'static {
     fn terminate_target(&self, id: &ScopeId, target: &TargetId) -> Result<(), BackendError>;
     fn kill_target(&self, id: &ScopeId, target: &TargetId) -> Result<(), BackendError>;
 
+    /// Freezes `id`, SIGTERMs every current member of it and its descendants
+    /// through pidfds, then unconditionally thaws it. A missing scope is
+    /// idempotent success.
+    fn terminate_scope(&self, id: &ScopeId) -> Result<(), BackendError>;
+
     /// SIGKILLs every process in `id` and descendants via `cgroup.kill`.
     fn kill_scope(&self, id: &ScopeId) -> Result<(), BackendError>;
 
@@ -145,6 +150,9 @@ impl<T: CgroupBackend + ?Sized> CgroupBackend for std::sync::Arc<T> {
     }
     fn kill_target(&self, id: &ScopeId, target: &TargetId) -> Result<(), BackendError> {
         (**self).kill_target(id, target)
+    }
+    fn terminate_scope(&self, id: &ScopeId) -> Result<(), BackendError> {
+        (**self).terminate_scope(id)
     }
     fn kill_scope(&self, id: &ScopeId) -> Result<(), BackendError> {
         (**self).kill_scope(id)

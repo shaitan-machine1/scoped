@@ -2,7 +2,7 @@
 
 `scoped` is **M0** of the [decoupling-logind](../..) plan: a D-Bus service
 that owns the cgroup v2 scope hierarchy, process membership, and
-tracked process termination and whole-scope kill -- and nothing else. It
+tracked process termination and graceful/forced whole-scope signalling -- and nothing else. It
 knows nothing about seats, sessions, service managers, or compositors.
 
 > Durable state lives entirely in the cgroup tree (including tracked-target
@@ -48,7 +48,8 @@ cargo fmt --check
 `crates/scoped/tests/e2e.rs` drives the actual compiled binary against a
 real cgroup v2 filesystem and a real D-Bus daemon: tracked and untracked
 moves, `TargetExists`/`ScopePopulated`, exact pidfd termination and kill,
-whole-scope kill, root-only policy, distinct target/scope lifecycle events,
+frozen whole-scope termination, whole-scope kill, root-only policy,
+distinct target/scope lifecycle events,
 and restart reconstruction of both cgroup and target watchers.
 
 Each case is hermetic: it starts its own `dbus-daemon` on a private socket
@@ -122,6 +123,7 @@ system bus (well-known name `org.decoupling.scoped1`):
 | `ScopePopulated(id)` | `s` -> `b` | Includes descendants; empty or missing scope is false. |
 | `TerminateTarget(id, target)` | `ss` -> `()` | SIGTERM to the exact process through pidfd. |
 | `KillTarget(id, target)` | `ss` -> `()` | SIGKILL to the exact process through pidfd. |
+| `TerminateScope(id)` | `s` -> `()` | Freezes the subtree, queues SIGTERM through pidfds for every current member, then unconditionally thaws; missing scope is success. |
 | `KillScope(id)` | `s` -> `()` | SIGKILLs the whole subtree via `cgroup.kill`; missing scope is success. |
 | `TargetGone(id, target)` | signal, `ss` | The binding no longer names a live process in that exact scope. |
 | `ScopeEmpty(id)` | signal, `s` | A scope's population (including descendants) dropped to zero. |

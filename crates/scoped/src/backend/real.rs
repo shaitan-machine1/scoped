@@ -4,6 +4,8 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+use std::thread;
+use std::time::{Duration, Instant};
 
 /// A [`CgroupBackend`] backed by a real cgroup v2 filesystem.
 ///
@@ -20,6 +22,10 @@ pub struct RealBackend {
 /// How many times [`RealBackend::create`] retries after losing a benign
 /// race with the empty-scope garbage collector (see `crate::watch`).
 const CREATE_RETRIES: usize = 3;
+
+/// Freezing is normally reflected immediately, but a bounded wait keeps a
+/// wedged kernel/filesystem from hanging the D-Bus worker forever.
+const FREEZE_TIMEOUT: Duration = Duration::from_secs(5);
 
 impl RealBackend {
     /// Opens (creating if needed) `mount/scope_root` as the managed root.
@@ -107,17 +113,51 @@ impl RealBackend {
         Ok(())
     }
 
-    pub(crate) fn read_populated(path: &Path) -> io::Result<bool> {
+    fn read_event(path: &Path, name: &str) -> io::Result<bool> {
         let content = fs::read_to_string(path.join("cgroup.events"))?;
         for line in content.lines() {
-            if let Some(v) = line.strip_prefix("populated ") {
-                return Ok(v.trim() == "1");
+            let mut fields = line.split_whitespace();
+            if fields.next() == Some(name) {
+                return match fields.next() {
+                    Some("0") => Ok(false),
+                    Some("1") => Ok(true),
+                    value => Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("invalid {name} value {value:?} in {}", path.display()),
+                    )),
+                };
             }
         }
-        Ok(false)
+        Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("cgroup.events at {} has no {name} field", path.display()),
+        ))
     }
 
-    #[cfg(test)]
+    pub(crate) fn read_populated(path: &Path) -> io::Result<bool> {
+        Self::read_event(path, "populated")
+    }
+
+    fn read_frozen(path: &Path) -> io::Result<bool> {
+        Self::read_event(path, "frozen")
+    }
+
+    fn wait_frozen(path: &Path) -> io::Result<()> {
+        let deadline = Instant::now() + FREEZE_TIMEOUT;
+        loop {
+            if Self::read_frozen(path)? {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!("timed out waiting for {} to freeze", path.display()),
+                ));
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+
     fn read_procs(path: &Path) -> io::Result<Vec<Pid>> {
         let content = fs::read_to_string(path.join("cgroup.procs"))?;
         Ok(content
@@ -308,6 +348,94 @@ impl CgroupBackend for RealBackend {
         }
     }
 
+    fn terminate_scope(&self, id: &ScopeId) -> Result<(), BackendError> {
+        // This is the same global operation lock used by Move and target
+        // metadata. While held, no scoped API call can migrate a process into
+        // the subtree between freezing and enumeration.
+        let _guard = self.target_lock.lock().unwrap();
+        let root = self.fs_path(id);
+        let freeze = root.join("cgroup.freeze");
+        match fs::write(&freeze, "1") {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(BackendError::from_io(id, "freeze scope", e)),
+        }
+
+        let mut first_error = None;
+        let mut handles = Vec::new();
+
+        if let Err(e) = Self::wait_frozen(&root) {
+            first_error = Some(BackendError::from_io(id, "wait for frozen scope", e));
+        } else {
+            let mut scopes = vec![id.clone()];
+            if let Err(e) = self.walk(&root, &mut scopes) {
+                first_error = Some(BackendError::from_io(id, "enumerate frozen scope", e));
+            }
+
+            for scope in scopes {
+                let path = self.fs_path(&scope);
+                let pids = match Self::read_procs(&path) {
+                    Ok(pids) => pids,
+                    // Empty descendants can be removed by their watcher while
+                    // the populated ancestor remains frozen.
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+                    Err(e) => {
+                        if first_error.is_none() {
+                            first_error =
+                                Some(BackendError::from_io(id, "read frozen scope members", e));
+                        }
+                        continue;
+                    }
+                };
+                for pid in pids {
+                    match ProcessHandle::open(pid) {
+                        Ok(handle) => handles.push(handle),
+                        // A process can finish while the freeze request is
+                        // converging. It is no longer a member to terminate.
+                        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                        Err(e) => {
+                            if first_error.is_none() {
+                                first_error = Some(BackendError::io(
+                                    format!("pinning process {pid} in frozen scope {id}"),
+                                    e,
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Queue all signals before thawing. Frozen tasks cannot handle
+            // SIGTERM or fork an escaping child until the cleanup below.
+            for handle in handles {
+                if let Err(e) = handle.send_terminate() {
+                    if e.raw_os_error() != Some(rustix::io::Errno::SRCH.raw_os_error())
+                        && first_error.is_none()
+                    {
+                        first_error = Some(BackendError::io(
+                            format!("terminate process {} in scope {id}", handle.identity().pid),
+                            e,
+                        ));
+                    }
+                }
+            }
+        }
+
+        // Never leave callers frozen, even when enumeration or signalling
+        // failed. Preserve the first operation error unless thawing is the
+        // only failure.
+        if let Err(e) = fs::write(&freeze, "0") {
+            if first_error.is_none() {
+                first_error = Some(BackendError::from_io(id, "thaw scope", e));
+            }
+        }
+
+        match first_error {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
+    }
+
     fn kill_scope(&self, id: &ScopeId) -> Result<(), BackendError> {
         let path = self.fs_path(id).join("cgroup.kill");
         match fs::write(&path, "1") {
@@ -404,16 +532,48 @@ mod tests {
     }
 
     #[test]
-    fn read_populated_parses_cgroup_events() {
+    fn read_populated_and_frozen_parse_cgroup_events() {
         let tmp = tempfile::tempdir().unwrap();
         let b = backend(&tmp);
         let id = ScopeId::parse("user/1000/sandbox").unwrap();
         b.create(&id).unwrap();
         let path = b.fs_path(&id);
-        fs::write(path.join("cgroup.events"), "populated 0\nfrozen 0\n").unwrap();
+        fs::write(path.join("cgroup.events"), "populated 0\nfrozen 1\n").unwrap();
         assert!(!b.is_populated(&id).unwrap());
+        assert!(RealBackend::read_frozen(&path).unwrap());
         fs::write(path.join("cgroup.events"), "populated 1\nfrozen 0\n").unwrap();
         assert!(b.is_populated(&id).unwrap());
+        assert!(!RealBackend::read_frozen(&path).unwrap());
+    }
+
+    #[test]
+    fn terminate_scope_thaws_after_a_freeze_state_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let b = backend(&tmp);
+        let id = ScopeId::parse("user/1000/sandbox").unwrap();
+        b.create(&id).unwrap();
+        let path = b.fs_path(&id);
+        fs::write(path.join("cgroup.freeze"), "0").unwrap();
+        fs::write(path.join("cgroup.events"), "populated 1\n").unwrap();
+
+        assert!(matches!(
+            b.terminate_scope(&id),
+            Err(BackendError::Io { .. })
+        ));
+        assert_eq!(
+            fs::read_to_string(path.join("cgroup.freeze"))
+                .unwrap()
+                .trim(),
+            "0"
+        );
+    }
+
+    #[test]
+    fn terminate_scope_is_idempotent_when_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let b = backend(&tmp);
+        let id = ScopeId::parse("user/1000/missing").unwrap();
+        b.terminate_scope(&id).unwrap();
     }
 
     #[test]

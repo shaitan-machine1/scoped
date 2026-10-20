@@ -162,6 +162,19 @@ impl Manager {
             .map_err(service_error)
     }
 
+    async fn terminate_scope(
+        &self,
+        id: String,
+        #[zbus(header)] header: Header<'_>,
+        #[zbus(connection)] conn: &Connection,
+    ) -> Result<(), ManagerError> {
+        let uid = caller_uid(conn, &header).await?;
+        let id = parse_id(&id)?;
+        self.service
+            .terminate_scope(uid, &id)
+            .map_err(service_error)
+    }
+
     async fn kill_scope(
         &self,
         id: String,
