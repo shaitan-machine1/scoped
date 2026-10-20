@@ -63,9 +63,15 @@ They're `#[ignore]`d, so a plain `cargo test` never touches real cgroups:
 ```sh
 sudo -E cargo test -p scoped --test e2e -- --ignored --test-threads=4
 
-# If cargo isn't on root's PATH, build as yourself and run the test binary:
-cargo test -p scoped --test e2e --no-run
-sudo ./target/debug/deps/e2e-* --ignored --test-threads=4
+# If cargo isn't on root's PATH, use a fresh target directory so an old
+# e2e executable can never be selected accidentally:
+target=$(mktemp -d)
+trap 'rm -rf "$target"' EXIT
+CARGO_TARGET_DIR="$target" cargo test -p scoped --test e2e --no-run
+test_binary=$(find "$target/debug/deps" -maxdepth 1 -type f -name 'e2e-*' -perm -111)
+sudo "$test_binary" --ignored --test-threads=4
+trap - EXIT
+rm -rf "$target"
 ```
 
 ## Installing
