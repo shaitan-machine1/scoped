@@ -278,6 +278,11 @@ impl TestBus {
         &self.address
     }
 
+    /// Takes the bus down under the daemons connected to it.
+    fn stop(&self) {
+        let _ = nix::sys::signal::kill(self.pid, nix::sys::signal::Signal::SIGTERM);
+    }
+
     async fn connect(&self) -> zbus::Connection {
         zbus::connection::Builder::address(self.address())
             .build()
@@ -331,6 +336,23 @@ impl ScopedProcess {
             p.push(seg);
         }
         p
+    }
+
+    /// Waits for `scoped` to exit on its own, returning its status, or
+    /// `None` on timeout.
+    fn wait_for_exit(&mut self, timeout: Duration) -> Option<std::process::ExitStatus> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            match self.child.try_wait() {
+                Ok(Some(status)) => return Some(status),
+                Ok(None) => {}
+                Err(e) => panic!("try_wait failed: {e}"),
+            }
+            if Instant::now() > deadline {
+                return None;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
     }
 
     /// SIGKILLs `scoped` itself, simulating a crash: the cgroup tree is
@@ -748,4 +770,85 @@ fn restart_recovers_targets_and_scope_watchers() {
         );
         assert!(!scoped_b.scope_path(&populated_id).exists());
     });
+}
+
+/// A second instance must not be able to take the well-known name away
+/// from the running one. zbus's default `RequestName` flags
+/// (ALLOW_REPLACEMENT | REPLACE_EXISTING | DO_NOT_QUEUE) would do exactly
+/// that, leaving the original alive but unreachable -- and, once the
+/// usurper exits, the name unowned, because DO_NOT_QUEUE keeps the
+/// original out of the queue too. A supervisor cannot see any of that, so
+/// duplicates have to fail instead.
+#[test]
+#[ignore]
+fn a_second_instance_refuses_to_steal_the_name() {
+    require_root();
+    let _wd = Watchdog::start(
+        "a_second_instance_refuses_to_steal_the_name",
+        Duration::from_secs(60),
+    );
+    let bus = TestBus::start();
+    let _first = ScopedProcess::spawn(&bus, &unique("scoped-e2e"));
+
+    zbus::block_on(async {
+        let connection = bus.connect().await;
+        let proxy = wait_for_manager(&connection).await;
+        let owner_before = zbus::fdo::DBusProxy::new(&connection)
+            .await
+            .unwrap()
+            .get_name_owner("org.decoupling.scoped1".try_into().unwrap())
+            .await
+            .expect("the first instance owns the name");
+
+        let mut second = ScopedProcess::spawn(&bus, &unique("scoped-e2e"));
+        let status = second
+            .wait_for_exit(Duration::from_secs(10))
+            .expect("the second instance should exit instead of stealing the name");
+        assert!(
+            !status.success(),
+            "the second instance exited successfully: {status:?}"
+        );
+
+        // The original is still the owner and still serving.
+        let owner_after = zbus::fdo::DBusProxy::new(&connection)
+            .await
+            .unwrap()
+            .get_name_owner("org.decoupling.scoped1".try_into().unwrap())
+            .await
+            .expect("the name still has an owner");
+        assert_eq!(owner_before, owner_after);
+        proxy
+            .list("sessiond/user")
+            .await
+            .expect("the first instance still answers");
+    });
+}
+
+/// Losing the bus costs us the name, and a process that is alive but
+/// nameless is invisible to the supervisor: every caller gets
+/// `ServiceUnknown` forever. Exiting non-zero is what gets us restarted.
+#[test]
+#[ignore]
+fn losing_the_bus_connection_exits_nonzero() {
+    require_root();
+    let _wd = Watchdog::start(
+        "losing_the_bus_connection_exits_nonzero",
+        Duration::from_secs(60),
+    );
+    let bus = TestBus::start();
+    let mut scoped = ScopedProcess::spawn(&bus, &unique("scoped-e2e"));
+
+    zbus::block_on(async {
+        let connection = bus.connect().await;
+        wait_for_manager(&connection).await;
+    });
+
+    bus.stop();
+    let status = scoped
+        .wait_for_exit(Duration::from_secs(10))
+        .expect("scoped should exit when the bus goes away");
+    assert!(
+        !status.success(),
+        "scoped exited successfully after losing the bus: {status:?}"
+    );
 }

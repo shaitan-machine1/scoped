@@ -171,6 +171,16 @@ never request data. The D-Bus policy also blocks non-root calls.
 - **Subscribe, then query.** D-Bus signals are not durable. Consumers arm
   target and scope streams first, then call `TargetExists` and
   `ScopePopulated` before initiating teardown.
+- **First owner wins, and losing the bus is fatal.** The name is requested
+  with `DO_NOT_QUEUE` alone, *not* zbus's default
+  `ALLOW_REPLACEMENT | REPLACE_EXISTING | DO_NOT_QUEUE`: with the defaults
+  any second instance silently steals `org.decoupling.scoped1` from the
+  running daemon, which keeps running unreachable, and once the usurper
+  exits the name is left unowned (`DO_NOT_QUEUE` keeps the original out of
+  the queue as well). A duplicate therefore fails to start, and if the
+  connection is ever lost `scoped` exits non-zero so the supervisor
+  restarts it -- an alive-but-nameless daemon looks healthy to the
+  supervisor while every caller gets `ServiceUnknown`.
 
 ### Known limitations
 
