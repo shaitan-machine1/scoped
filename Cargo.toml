@@ -4,7 +4,7 @@ members = ["crates/scope-id", "crates/scoped"]
 
 [workspace.package]
 edition = "2021"
-license = "MIT OR Apache-2.0"
+license = "GPL-3.0-only"
 repository = "https://github.com/shaitan-machine1/scoped"
 
 [profile.release]
