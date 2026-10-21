@@ -1,7 +1,7 @@
 use super::{BackendError, CgroupBackend, Pid, ProcessHandle, TargetStatus};
 use scope_id::{ScopeId, TargetId};
-use std::fs;
-use std::io;
+use std::fs::{self, File};
+use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::thread;
@@ -113,8 +113,7 @@ impl RealBackend {
         Ok(())
     }
 
-    fn read_event(path: &Path, name: &str) -> io::Result<bool> {
-        let content = fs::read_to_string(path.join("cgroup.events"))?;
+    fn parse_event(content: &str, path: &Path, name: &str) -> io::Result<bool> {
         for line in content.lines() {
             let mut fields = line.split_whitespace();
             if fields.next() == Some(name) {
@@ -132,6 +131,22 @@ impl RealBackend {
             io::ErrorKind::InvalidData,
             format!("cgroup.events at {} has no {name} field", path.display()),
         ))
+    }
+
+    fn read_event_file(file: &mut File, path: &Path, name: &str) -> io::Result<bool> {
+        file.seek(SeekFrom::Start(0))?;
+        let mut content = String::new();
+        file.read_to_string(&mut content)?;
+        Self::parse_event(&content, path, name)
+    }
+
+    fn read_event(path: &Path, name: &str) -> io::Result<bool> {
+        let mut file = File::open(path.join("cgroup.events"))?;
+        Self::read_event_file(&mut file, path, name)
+    }
+
+    pub(crate) fn read_populated_file(file: &mut File, path: &Path) -> io::Result<bool> {
+        Self::read_event_file(file, path, "populated")
     }
 
     pub(crate) fn read_populated(path: &Path) -> io::Result<bool> {
@@ -538,12 +553,29 @@ mod tests {
         let id = ScopeId::parse("user/1000/sandbox").unwrap();
         b.create(&id).unwrap();
         let path = b.fs_path(&id);
-        fs::write(path.join("cgroup.events"), "populated 0\nfrozen 1\n").unwrap();
+        let events_path = path.join("cgroup.events");
+        fs::write(&events_path, "populated 0\nfrozen 1\n").unwrap();
         assert!(!b.is_populated(&id).unwrap());
         assert!(RealBackend::read_frozen(&path).unwrap());
-        fs::write(path.join("cgroup.events"), "populated 1\nfrozen 0\n").unwrap();
+
+        let mut file = File::open(&events_path).unwrap();
+        assert!(!RealBackend::read_populated_file(&mut file, &path).unwrap());
+        assert_eq!(
+            file.stream_position().unwrap(),
+            fs::metadata(&events_path).unwrap().len()
+        );
+        fs::write(&events_path, "populated 1\nfrozen 0\n").unwrap();
+        assert!(RealBackend::read_populated_file(&mut file, &path).unwrap());
         assert!(b.is_populated(&id).unwrap());
         assert!(!RealBackend::read_frozen(&path).unwrap());
+    }
+
+    #[test]
+    fn event_parser_rejects_missing_and_invalid_values() {
+        let path = Path::new("/test/scope");
+        assert!(RealBackend::parse_event("frozen 0\n", path, "populated").is_err());
+        assert!(RealBackend::parse_event("populated 2\n", path, "populated").is_err());
+        assert!(RealBackend::parse_event("populated\n", path, "populated").is_err());
     }
 
     #[test]

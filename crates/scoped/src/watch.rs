@@ -138,7 +138,7 @@ impl Watchers {
                 return;
             }
             let events_path = path.join("cgroup.events");
-            let file = match File::open(&events_path) {
+            let mut file = match File::open(&events_path) {
                 Ok(f) => f,
                 Err(_) => {
                     // Directory (or just the events file) is gone already.
@@ -146,7 +146,11 @@ impl Watchers {
                     return;
                 }
             };
-            let populated = match RealBackend::read_populated(&path) {
+            // Reading the exact fd that is about to be polled synchronizes
+            // kernfs's per-open event counter. Reading through a second open
+            // leaves this fd immediately ready with POLLPRI|POLLERR and turns
+            // the watcher into a busy loop.
+            let populated = match RealBackend::read_populated_file(&mut file, &path) {
                 Ok(p) => p,
                 Err(_) => {
                     self.forget(&id);

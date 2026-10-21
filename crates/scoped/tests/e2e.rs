@@ -26,7 +26,9 @@
 //! sudo -E cargo test -p scoped --test e2e -- --ignored
 //! ```
 
-use std::io::Write;
+use std::fs::File;
+use std::io::{Read, Seek, SeekFrom, Write};
+use std::os::fd::AsFd;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Path, PathBuf};
@@ -35,6 +37,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use futures_util::StreamExt;
+use nix::poll::{poll, PollFd, PollFlags, PollTimeout};
 
 #[zbus::proxy(
     interface = "org.decoupling.scoped1.Manager",
@@ -97,6 +100,21 @@ fn unique(prefix: &str) -> String {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
     format!("{prefix}-{}-{n}", std::process::id())
+}
+
+fn process_cpu_ticks(pid: u32) -> u64 {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).expect("read process stat");
+    let fields = stat
+        .rsplit_once(") ")
+        .expect("process stat has a command terminator")
+        .1
+        .split_whitespace()
+        .collect::<Vec<_>>();
+    let user = fields[11].parse::<u64>().expect("parse process user ticks");
+    let system = fields[12]
+        .parse::<u64>()
+        .expect("parse process system ticks");
+    user + system
 }
 
 /// Removes a cgroup directory tree bottom-up.
@@ -417,6 +435,60 @@ fn busctl_call_as(bus: &TestBus, uid: u32, args: &[&str]) -> (bool, String) {
         out.status.success(),
         String::from_utf8_lossy(&out.stderr).into_owned(),
     )
+}
+
+#[test]
+#[ignore]
+fn synchronized_scope_watchers_block_without_spinning() {
+    require_root();
+    let _wd = Watchdog::start(
+        "synchronized_scope_watchers_block_without_spinning",
+        Duration::from_secs(60),
+    );
+    let bus = TestBus::start();
+    let scoped = ScopedProcess::spawn(&bus, &unique("scoped-e2e"));
+    let scoped_pid = scoped.child.id();
+
+    zbus::block_on(async {
+        let connection = bus.connect().await;
+        let proxy = wait_for_manager(&connection).await;
+        let mut members = Vec::new();
+        let mut ids = Vec::new();
+        for _ in 0..4 {
+            let id = format!("sessiond/user/0/session/{}", unique("cpu"));
+            proxy.create(&id).await.expect("Create");
+            let member = Member::spawn(&["sleep", "300"]);
+            proxy
+                .move_pid(member.pid(), &id, "manager")
+                .await
+                .expect("tracked Move");
+            ids.push(id);
+            members.push(member);
+        }
+
+        // Establishing the baseline by reading this exact open file must make
+        // a subsequent POLLPRI wait block until the requested timeout.
+        let events_path = scoped.scope_path(&ids[0]).join("cgroup.events");
+        let mut events = File::open(&events_path).expect("open cgroup.events");
+        events.seek(SeekFrom::Start(0)).unwrap();
+        let mut content = String::new();
+        events.read_to_string(&mut content).unwrap();
+        assert!(content.lines().any(|line| line == "populated 1"));
+        let mut fds = [PollFd::new(events.as_fd(), PollFlags::POLLPRI)];
+        let started = Instant::now();
+        assert_eq!(poll(&mut fds, PollTimeout::from(250u16)).unwrap(), 0);
+        assert!(started.elapsed() >= Duration::from_millis(200));
+
+        // Four unsynchronized watcher fds previously consumed about four CPU
+        // cores. Allow a generous scheduler/debug-build margin while still
+        // making that regression unmistakable.
+        let before = process_cpu_ticks(scoped_pid);
+        std::thread::sleep(Duration::from_millis(1500));
+        let delta = process_cpu_ticks(scoped_pid) - before;
+        assert!(delta <= 20, "idle scoped consumed {delta} CPU ticks");
+
+        drop(members);
+    });
 }
 
 #[test]

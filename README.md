@@ -167,7 +167,10 @@ never request data. The D-Bus policy also blocks non-root calls.
   case this can't distinguish.
 - **Target vs. scope lifecycle.** pidfd readiness emits `TargetGone` for one
   registered process. `cgroup.events` emits `ScopeEmpty`; the existing
-  watcher then removes the directory and emits `ScopeRemoved`.
+  watcher then removes the directory and emits `ScopeRemoved`. Each scope
+  watcher rewinds and reads the exact `cgroup.events` fd it polls, synchronizing
+  kernfs's per-open event counter so an unchanged scope blocks instead of
+  repeatedly reporting `POLLPRI|POLLERR`.
 - **Subscribe, then query.** D-Bus signals are not durable. Consumers arm
   target and scope streams first, then call `TargetExists` and
   `ScopePopulated` before initiating teardown.
