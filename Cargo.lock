@@ -62,6 +62,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "anyhow"
+version = "1.0.104"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
+
+[[package]]
 name = "async-trait"
 version = "0.1.92"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -429,6 +435,17 @@ checksum = "cf54715a573b99ac80df0bc206da022bcd442c974952c7b9720069370852e21f"
 [[package]]
 name = "scope-id"
 version = "0.1.0"
+
+[[package]]
+name = "scopectl"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "scope-id",
+ "tokio",
+ "zbus",
+]
 
 [[package]]
 name = "scoped"
