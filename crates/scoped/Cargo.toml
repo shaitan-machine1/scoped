@@ -12,6 +12,7 @@ path = "src/main.rs"
 
 [dependencies]
 scope-id = { path = "../scope-id" }
+scoped-api = { path = "../scoped-api" }
 zbus = "6"
 clap = { version = "4", features = ["derive"] }
 nix = { version = "0.30", features = ["signal", "poll", "fs", "process", "user"] }

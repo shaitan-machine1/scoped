@@ -1,0 +1,10 @@
+[package]
+name = "scoped-api"
+version = "0.1.0"
+description = "Typed public D-Bus protocol for scoped"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+zbus = { version = "6", features = ["tokio"] }

@@ -15,8 +15,8 @@ This repo is a three-crate Cargo workspace:
 | Crate | What |
 |---|---|
 | [`crates/scope-id`](crates/scope-id) | Dependency-free library: portable `ScopeId`/`TargetId` parsing and the `sessiond/...`/`user/...` naming conventions. Pinned by git tag from other repos (e.g. `sessiond`). |
+| [`crates/scoped-api`](crates/scoped-api) | Typed zbus proxies and protocol constants for external clients. |
 | [`crates/scoped`](crates/scoped) | The Linux `scoped` binary: D-Bus service, cgroup v2 backend, pidfd target watchers, and empty-scope GC. |
-| [`crates/scopectl`](crates/scopectl) | Readable system-bus client for listing, looking up, terminating and killing managed scopes. |
 
 Plus [`dist/dbus/org.decoupling.scoped1.conf`](dist/dbus/org.decoupling.scoped1.conf),
 the bus policy -- see [Installing](#installing).
@@ -50,9 +50,8 @@ cargo fmt --check
 real cgroup v2 filesystem and a real D-Bus daemon: tracked and untracked
 moves, `TargetExists`/`ScopePopulated`, exact pidfd termination and kill,
 frozen whole-scope termination, whole-scope kill, root-only policy,
-distinct target/scope lifecycle events, administrative-client output and
-root authorization, and restart reconstruction of both cgroup and target
-watchers.
+distinct target/scope lifecycle events, and restart reconstruction of both
+cgroup and target watchers.
 
 Each case is hermetic: it starts its own `dbus-daemon` on a private socket
 and gets its own `--scope-root`, so the tests need no installed bus policy
@@ -65,11 +64,9 @@ They're `#[ignore]`d, so a plain `cargo test` never touches real cgroups:
 ```sh
 sudo -E cargo test -p scoped --test e2e -- --ignored --test-threads=4
 
-# If cargo isn't on root's PATH, use a fresh target directory so an old
-# e2e executable can never be selected accidentally:
+# If cargo isn't on root's PATH, compile as the normal user first:
 target=$(mktemp -d)
 trap 'rm -rf "$target"' EXIT
-CARGO_TARGET_DIR="$target" cargo build -p scopectl
 CARGO_TARGET_DIR="$target" cargo test -p scoped --test e2e --no-run
 test_binary=$(find "$target/debug/deps" -maxdepth 1 -type f -name 'e2e-*' -perm -111)
 sudo "$test_binary" --ignored --test-threads=4
@@ -89,26 +86,13 @@ install -Dm644 dist/dbus/org.decoupling.scoped1.conf \
     /usr/share/dbus-1/system.d/org.decoupling.scoped1.conf
 ```
 
-Install both `scoped` and `scopectl` under `/usr/bin`. Phase 1 is root-only.
-The policy rejects non-root method traffic as defense in depth, and `scoped`
-independently verifies the D-Bus caller UID on every method.
+Install `scoped` under `/usr/bin`. Phase 1 is root-only. The policy rejects
+non-root method traffic as defense in depth, and `scoped` independently
+verifies the D-Bus caller UID on every method.
 
-## Administrative client
-
-`scopectl` uses only the system bus and relies on the bus policy and daemon
-peer credentials for authorization:
-
-```sh
-scopectl list PREFIX
-scopectl scope-of PID
-scopectl terminate SCOPE_ID
-scopectl kill SCOPE_ID
-```
-
-Lists use a `SCOPE` heading or print `No matching scopes.`. A process outside
-the managed hierarchy is a successful query reported as `PID N is not in a
-managed scope.`. Mutation commands print which operation was requested and do
-not prompt.
+Administrative presentation belongs to the separate unified `loginctl`
+repository, which consumes `scoped-api`. This repository intentionally ships
+no component-specific CLI.
 
 ## Running it by hand
 

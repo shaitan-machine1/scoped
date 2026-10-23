@@ -5,17 +5,13 @@ use crate::policy::PolicyError;
 use crate::service::{Service, ServiceError};
 use crate::watch::Watchers;
 use scope_id::{ScopeId, TargetId};
+pub use scoped_api::{BUS_NAME, OBJECT_PATH};
 use std::sync::Arc;
 use zbus::fdo;
 use zbus::message::Header;
 use zbus::names::BusName;
 use zbus::object_server::SignalEmitter;
 use zbus::Connection;
-
-pub const BUS_NAME: &str = "org.decoupling.scoped1";
-pub const OBJECT_PATH: &str = "/org/decoupling/scoped1";
-#[allow(dead_code)]
-pub const INTERFACE_NAME: &str = "org.decoupling.scoped1.Manager";
 
 #[derive(Debug, zbus::DBusError)]
 #[zbus(prefix = "org.decoupling.scoped1.Error")]
@@ -283,7 +279,7 @@ mod tests {
 
     #[test]
     fn interface_name_matches_the_macro_attribute() {
-        assert_eq!(INTERFACE_NAME, "org.decoupling.scoped1.Manager");
+        assert_eq!(scoped_api::INTERFACE_NAME, "org.decoupling.scoped1.Manager");
     }
 
     #[test]

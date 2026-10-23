@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/scope-id", "crates/scoped", "crates/scopectl"]
+members = ["crates/scope-id", "crates/scoped-api", "crates/scoped"]
 
 [workspace.package]
 edition = "2021"

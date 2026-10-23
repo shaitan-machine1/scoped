@@ -62,12 +62,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "anyhow"
-version = "1.0.104"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
-
-[[package]]
 name = "async-trait"
 version = "0.1.92"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -437,17 +431,6 @@ name = "scope-id"
 version = "0.1.0"
 
 [[package]]
-name = "scopectl"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "clap",
- "scope-id",
- "tokio",
- "zbus",
-]
-
-[[package]]
 name = "scoped"
 version = "0.1.0"
 dependencies = [
@@ -456,11 +439,19 @@ dependencies = [
  "nix",
  "rustix",
  "scope-id",
+ "scoped-api",
  "tempfile",
  "thiserror",
  "tracing",
  "tracing-subscriber",
  "xattr",
+ "zbus",
+]
+
+[[package]]
+name = "scoped-api"
+version = "0.1.0"
+dependencies = [
  "zbus",
 ]
 

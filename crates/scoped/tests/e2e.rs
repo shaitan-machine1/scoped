@@ -32,49 +32,13 @@ use std::os::fd::AsFd;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Output, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use futures_util::StreamExt;
 use nix::poll::{poll, PollFd, PollFlags, PollTimeout};
-
-#[zbus::proxy(
-    interface = "org.decoupling.scoped1.Manager",
-    default_service = "org.decoupling.scoped1",
-    default_path = "/org/decoupling/scoped1"
-)]
-trait Manager {
-    async fn create(&self, id: &str) -> zbus::Result<()>;
-
-    #[zbus(name = "Move")]
-    async fn move_pid(&self, pid: u32, id: &str, target_id: &str) -> zbus::Result<()>;
-
-    async fn scope_of(&self, pid: u32) -> zbus::Result<String>;
-
-    async fn list(&self, prefix: &str) -> zbus::Result<Vec<String>>;
-
-    async fn target_exists(&self, id: &str, target_id: &str) -> zbus::Result<bool>;
-
-    async fn scope_populated(&self, id: &str) -> zbus::Result<bool>;
-
-    async fn terminate_target(&self, id: &str, target_id: &str) -> zbus::Result<()>;
-
-    async fn kill_target(&self, id: &str, target_id: &str) -> zbus::Result<()>;
-
-    async fn terminate_scope(&self, id: &str) -> zbus::Result<()>;
-
-    async fn kill_scope(&self, id: &str) -> zbus::Result<()>;
-
-    #[zbus(signal)]
-    fn target_gone(&self, id: String, target_id: String) -> zbus::Result<()>;
-
-    #[zbus(signal)]
-    fn scope_empty(&self, id: String) -> zbus::Result<()>;
-
-    #[zbus(signal)]
-    fn scope_removed(&self, id: String) -> zbus::Result<()>;
-}
+use scoped_api::ManagerProxy;
 
 const SIGTERM: i32 = 15;
 const SIGKILL: i32 = 9;
@@ -410,43 +374,6 @@ async fn wait_for_manager(connection: &zbus::Connection) -> ManagerProxy<'static
     ManagerProxy::new(connection)
         .await
         .expect("build ManagerProxy")
-}
-
-/// Runs the administrative client against the test bus as `uid`.
-fn scopectl_call_as(bus: &TestBus, uid: u32, args: &[&str]) -> Output {
-    let binary = std::env::var_os("SCOPECTL_E2E_BIN")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            std::env::current_exe()
-                .expect("resolve e2e test executable")
-                .parent()
-                .expect("e2e executable has deps parent")
-                .parent()
-                .expect("deps has debug parent")
-                .join("scopectl")
-        });
-    assert!(
-        binary.is_file(),
-        "build scopectl first or set SCOPECTL_E2E_BIN: {}",
-        binary.display()
-    );
-    // The checkout may live below a mode-0700 home directory. Copy the
-    // client beside the private bus so the nobody authorization probes can
-    // execute it without weakening host directory permissions.
-    let executable = bus.dir.path().join("scopectl");
-    if !executable.exists() {
-        std::fs::copy(&binary, &executable).expect("copy scopectl into test bus directory");
-        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755))
-            .expect("make test scopectl executable");
-    }
-    Command::new(executable)
-        .args(args)
-        .uid(uid)
-        .gid(uid)
-        .env("HOME", "/tmp")
-        .env("DBUS_SYSTEM_BUS_ADDRESS", bus.address())
-        .output()
-        .expect("run scopectl")
 }
 
 /// Runs `busctl call ...` against the test bus as `uid`, returning
@@ -820,123 +747,6 @@ fn every_unprivileged_caller_is_denied() {
             "expected root-only AccessDenied, got: {stderr}"
         );
         assert!(!scoped.scope_path(id).exists());
-    }
-}
-
-#[test]
-#[ignore]
-fn scopectl_covers_inventory_lookup_mutation_and_authorization() {
-    require_root();
-    let _wd = Watchdog::start(
-        "scopectl_covers_inventory_lookup_mutation_and_authorization",
-        Duration::from_secs(60),
-    );
-    let bus = TestBus::start();
-    let _scoped = ScopedProcess::spawn(&bus, &unique("scoped-e2e"));
-    let prefix = format!("admin/{}", unique("cli"));
-    let term_id = format!("{prefix}/term");
-    let kill_id = format!("{prefix}/kill");
-
-    zbus::block_on(async {
-        let connection = bus.connect().await;
-        wait_for_manager(&connection).await;
-    });
-    let empty = scopectl_call_as(&bus, 0, &["list", &prefix]);
-    assert!(empty.status.success());
-    assert_eq!(
-        String::from_utf8_lossy(&empty.stdout),
-        "No matching scopes.\n"
-    );
-
-    let (mut term_member, mut kill_member) = zbus::block_on(async {
-        let connection = bus.connect().await;
-        let proxy = wait_for_manager(&connection).await;
-        proxy.create(&term_id).await.unwrap();
-        proxy.create(&kill_id).await.unwrap();
-        let term_member = Member::spawn(&["sleep", "300"]);
-        let kill_member = Member::spawn(&["sleep", "300"]);
-        proxy
-            .move_pid(term_member.pid(), &term_id, "")
-            .await
-            .unwrap();
-        proxy
-            .move_pid(kill_member.pid(), &kill_id, "")
-            .await
-            .unwrap();
-        (term_member, kill_member)
-    });
-
-    let listed = scopectl_call_as(&bus, 0, &["list", &prefix]);
-    assert!(listed.status.success());
-    let listed = String::from_utf8_lossy(&listed.stdout);
-    assert!(listed.starts_with("SCOPE\n"));
-    assert!(listed.lines().any(|line| line == term_id));
-    assert!(listed.lines().any(|line| line == kill_id));
-
-    let found = scopectl_call_as(&bus, 0, &["scope-of", &term_member.pid().to_string()]);
-    assert!(found.status.success());
-    let found = String::from_utf8_lossy(&found.stdout);
-    assert_eq!(found.lines().next().unwrap().trim_start(), "PID  SCOPE");
-    assert!(found.ends_with(&format!("  {term_id}\n")));
-    let absent = scopectl_call_as(&bus, 0, &["scope-of", "1"]);
-    assert!(absent.status.success());
-    assert_eq!(
-        String::from_utf8_lossy(&absent.stdout),
-        "PID 1 is not in a managed scope.\n"
-    );
-
-    for args in [
-        vec!["list", prefix.as_str()],
-        vec!["scope-of", "1"],
-        vec!["terminate", term_id.as_str()],
-        vec!["kill", kill_id.as_str()],
-    ] {
-        let denied = scopectl_call_as(&bus, NOBODY, &args);
-        assert!(!denied.status.success(), "non-root {args:?} succeeded");
-        let stderr = String::from_utf8_lossy(&denied.stderr);
-        assert!(
-            stderr.contains("AccessDenied") || stderr.contains("root-only"),
-            "unexpected authorization error for {args:?}: {stderr}"
-        );
-    }
-
-    let terminated = scopectl_call_as(&bus, 0, &["terminate", &term_id]);
-    assert!(terminated.status.success());
-    assert_eq!(
-        String::from_utf8_lossy(&terminated.stdout),
-        format!("Termination requested for scope {term_id}.\n")
-    );
-    assert_eq!(
-        term_member
-            .wait_for_exit(Duration::from_secs(5))
-            .expect("terminated member exits")
-            .signal(),
-        Some(SIGTERM)
-    );
-
-    let killed = scopectl_call_as(&bus, 0, &["kill", &kill_id]);
-    assert!(killed.status.success());
-    assert_eq!(
-        String::from_utf8_lossy(&killed.stdout),
-        format!("Immediate kill requested for scope {kill_id}.\n")
-    );
-    assert_eq!(
-        kill_member
-            .wait_for_exit(Duration::from_secs(5))
-            .expect("killed member exits")
-            .signal(),
-        Some(SIGKILL)
-    );
-
-    let deadline = Instant::now() + Duration::from_secs(5);
-    loop {
-        let listed = scopectl_call_as(&bus, 0, &["list", &prefix]);
-        assert!(listed.status.success());
-        if listed.stdout == b"No matching scopes.\n" {
-            break;
-        }
-        assert!(Instant::now() < deadline, "scope removal timed out");
-        std::thread::sleep(Duration::from_millis(20));
     }
 }
 
